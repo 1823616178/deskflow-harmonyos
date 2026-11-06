@@ -85,6 +85,24 @@ int32_t keysymToKeycode(uint32_t keysym)
         case '+':       return KEYCODE_PLUS;             // 2066
         case 0x002a:    return KEYCODE_STAR;             // '*' (=2010)
         case 0x0023:    return KEYCODE_POUND;            // '#' (=2011)
+        // --- shifted punctuation (previously unmapped -> dropped) ---
+        case '!':       return KEYCODE_0 + 1;            // Shift+1
+        case '"':       return KEYCODE_APOSTROPHE;       // Shift+'
+        case '$':       return KEYCODE_0 + 4;            // Shift+4
+        case '%':       return KEYCODE_0 + 5;            // Shift+5
+        case '^':       return KEYCODE_0 + 6;            // Shift+6
+        case '&':       return KEYCODE_0 + 7;            // Shift+7
+        case '(':       return KEYCODE_0 + 9;            // Shift+9
+        case ')':       return KEYCODE_0;                // Shift+0
+        case '_':       return KEYCODE_MINUS;            // Shift+-
+        case '{':       return KEYCODE_LEFT_BRACKET;     // Shift+[
+        case '}':       return KEYCODE_RIGHT_BRACKET;    // Shift+]
+        case '|':       return KEYCODE_BACKSLASH;        // Shift+backslash
+        case ':':       return KEYCODE_SEMICOLON;        // Shift+;
+        case '<':       return KEYCODE_COMMA;            // Shift+,
+        case '>':       return KEYCODE_PERIOD;           // Shift+.
+        case '?':       return KEYCODE_SLASH;            // Shift+/
+        case '~':       return KEYCODE_GRAVE;            // Shift+`
     }
 
     // 光标/编辑键
@@ -95,6 +113,7 @@ int32_t keysymToKeycode(uint32_t keysym)
         case kKeyEscape:    return KEYCODE_ESCAPE;       // 2070
         case kKeyHome:      return KEYCODE_MOVE_HOME;    // 2081
         case kKeyEnd:       return KEYCODE_MOVE_END;     // 2082
+        case kKeyBegin:     return KEYCODE_MOVE_HOME;    // 无等价键，用 HOME 近似
         case kKeyLeft:      return KEYCODE_DPAD_LEFT;    // 2014
         case kKeyUp:        return KEYCODE_DPAD_UP;      // 2012
         case kKeyRight:     return KEYCODE_DPAD_RIGHT;   // 2015
@@ -132,6 +151,10 @@ int32_t keysymToKeycode(uint32_t keysym)
         case kKeyMetaR:       return KEYCODE_META_RIGHT;     // 2077
         case kKeySuperL:      return KEYCODE_META_LEFT;      // Super=Meta
         case kKeySuperR:      return KEYCODE_META_RIGHT;
+        case kKeyHyperL:      return KEYCODE_META_LEFT;      // 无 Hyper，用 Meta 近似
+        case kKeyHyperR:      return KEYCODE_META_RIGHT;
+        case kKeyShiftLock:   return KEYCODE_CAPS_LOCK;     // ShiftLock ~ CapsLock
+        case kKeyCompose:     return KEYCODE_MENU;          // Compose 无等价键，用 Menu 近似
     }
 
     // 系统键
@@ -172,6 +195,16 @@ int32_t keysymToKeycode(uint32_t keysym)
         case kKeyWWWForward:    return KEYCODE_FORWARDMAIL;       // 2654 近似
         case kKeyWWWHome:       return KEYCODE_HOME;              // 1 近似
         case kKeyWWWRefresh:    return KEYCODE_REFRESH;           // 2635
+    }
+
+    // 小键盘功能/编辑键（之前未映射）
+    if (keysym >= kKeyKP_F1 && keysym <= kKeyKP_F4) {
+        return KEYCODE_F1 + static_cast<int32_t>(keysym - kKeyKP_F1);
+    }
+    switch (keysym) {
+        case kKeyKP_Space:  return KEYCODE_SPACE;
+        case kKeyKP_Tab:    return KEYCODE_TAB;
+        case kKeyKP_Begin:  return KEYCODE_MOVE_HOME;  // 无等价键，用 HOME 近似
     }
 
     // 小键盘数字 0-9 与符号（Deskflow KeyID 0xEFB0..=KP_0，映射到 NUMPAD）
