@@ -9,6 +9,8 @@
 ## 1. 传输层：TCP + PacketStreamFilter 帧封装
 
 Deskflow 协议承载在 **纯 TCP** 之上（默认端口 `24800`），没有应用层加密与鉴权。
+同一局域网内的任何人都能连接并注入输入、读取剪贴板：仅在可信局域网
+使用，不要暴露到公共网络（另见 README「安全警告」）。
 
 所有消息都经过服务端的 `PacketStreamFilter` 做帧化：
 
@@ -108,7 +110,7 @@ ProtoUtil::writef(out, "%7s%2i%2i%s",
 | `EBAD` | Bad | — | S→C | 协议违规 |
 | `QINF` | QueryInfo | — | S→C | 查询屏幕信息，客户端答 `DINF` |
 | `DINF` | DeviceInfo | `%2i%2i%2i%2i%2i%2i%2i` | C→S | x, y, w, h, 0, mx(鼠标x), my(鼠标y) |
-| `DSOP` | SetOptions | `%4I` | S→C | 设置一组选项；**收到即代表握手完成，进入运行期** |
+| `DSOP` | SetOptions | `%4I` | S→C | 设置一组选项；**收到即代表握手完成，进入运行期**。本工程把原始选项字保留在 `m_serverOptions`（可查、可打日志），不直接丢弃；但数值 option id 的上游含义未经核实，**不得凭猜测的 id 静默关闭功能**（如剪贴板），需对照上游 `OptionTypes` 确认后再启用。 |
 | `CROP` | ResetOptions | — | S→C | 重置选项 |
 | `CIAK` | InfoAck | — | S→C | 信息确认 |
 | `CBYE` | Close | — | S→C | 关闭连接 |
