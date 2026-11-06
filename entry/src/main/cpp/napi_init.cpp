@@ -13,8 +13,10 @@
  * limitations under the License.
  */
 
+#include <atomic>
 #include <string>
 #include <sstream>
+#include <vector>
 #include <map>
 #include <mutex>
 #include <chrono>
@@ -39,6 +41,88 @@ static napi_threadsafe_function g_clipboardTsfn = nullptr;
 // 保护 g_statusTsfn / g_tsfn 跨线程访问的互斥锁
 // （worker 线程/MMI 回调线程 与 JS 线程并发）
 static std::mutex g_tsfnMutex;
+// Set while a background connect starter is running, so two rapid
+// connectDeskflow() calls cannot spawn two starters racing on the
+// same global client.
+static std::atomic<bool> g_connectInProgress{false};
+// Trail generation: starting a new trail cancels any older one still
+// injecting, instead of letting two threads fight over the pointer.
+static std::atomic<int32_t> g_trailGeneration{0};
+
+// Create a napi string from a std::string (no hand-counted lengths:
+// the old code passed 15 for a 16-char string and truncated it).
+static napi_value MakeString(napi_env env, const std::string& s)
+{
+    napi_value result = nullptr;
+    napi_create_string_utf8(env, s.c_str(), s.size(), &result);
+    return result;
+}
+
+// Read a string argument with dynamic allocation (no 1MB stack buffer,
+// no silent truncation). Returns false on missing/wrong-type/oversize.
+static bool GetStringArg(napi_env env, napi_value arg, std::string& out, size_t maxLen)
+{
+    size_t len = 0;
+    if (napi_get_value_string_utf8(env, arg, nullptr, 0, &len) != napi_ok) {
+        return false;
+    }
+    if (len > maxLen) {
+        return false;
+    }
+    std::vector<char> buf(len + 1, 0);
+    size_t copied = 0;
+    if (napi_get_value_string_utf8(env, arg, buf.data(), buf.size(), &copied) != napi_ok) {
+        return false;
+    }
+    out.assign(buf.data(), copied);
+    return true;
+}
+
+static bool GetIntArg(napi_env env, napi_value arg, int32_t& out)
+{
+    return napi_get_value_int32(env, arg, &out) == napi_ok;
+}
+
+static bool GetBoolArg(napi_env env, napi_value arg, bool& out)
+{
+    return napi_get_value_bool(env, arg, &out) == napi_ok;
+}
+
+// Unified threadsafe-function creation. Previously each of the three
+// callbacks hand-rolled this, and OnChange passed a NULL resource name
+// which HarmonyOS rejects with napi_invalid_arg, so the interceptor
+// diagnostics callback could never be delivered.
+static napi_status CreateTsfn(napi_env env, napi_value callback, const char* resourceName,
+    napi_threadsafe_function_call_js callJs, napi_threadsafe_function* out)
+{
+    napi_valuetype type = napi_undefined;
+    if (napi_typeof(env, callback, &type) != napi_ok || type != napi_function) {
+        DF_LOGE("CreateTsfn %s: callback is not a function", resourceName);
+        return napi_invalid_arg;
+    }
+    napi_value name = nullptr;
+    napi_create_string_utf8(env, resourceName, NAPI_AUTO_LENGTH, &name);
+    napi_status st = napi_create_threadsafe_function(env, callback, nullptr, name, 0, 1,
+        nullptr, nullptr, nullptr, callJs, out);
+    if (st != napi_ok) {
+        DF_LOGE("CreateTsfn %s failed: %{public}d", resourceName, static_cast<int>(st));
+    }
+    return st;
+}
+
+// Non-blocking tsfn call that frees the payload if the call is refused
+// (queue closing/full); the old code leaked the string in that case.
+static void CallTsfn(napi_threadsafe_function tsfn, std::string* value)
+{
+    if (tsfn == nullptr) {
+        delete value;
+        return;
+    }
+    napi_status st = napi_call_threadsafe_function(tsfn, value, napi_tsfn_nonblocking);
+    if (st != napi_ok) {
+        delete value;
+    }
+}
 
 void DeskflowStatusCallJs(napi_env env, napi_value js_cb, void* context, void* data)
 {
@@ -71,7 +155,7 @@ void DeskflowStatusCb(const std::string& status)
         DF_LOGW("DeskflowStatusCb: status callback not registered yet, drop '%{public}s'", status.c_str());
         return;
     }
-    napi_call_threadsafe_function(tsfn, new std::string(status), napi_tsfn_nonblocking);
+    CallTsfn(tsfn, new std::string(status));
 }
 
 static napi_value OnDeskflowStatus(napi_env env, napi_callback_info info)
@@ -79,19 +163,16 @@ static napi_value OnDeskflowStatus(napi_env env, napi_callback_info info)
     size_t argc = 1;
     napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) {
+        return nullptr;
+    }
     std::lock_guard<std::mutex> lock(g_tsfnMutex);
     if (g_statusTsfn != nullptr) {
         // ArkTS 侧通常只在 aboutToAppear 注册一次；若重复注册，先收队释放旧的
         napi_release_threadsafe_function(g_statusTsfn, napi_tsfn_release);
         g_statusTsfn = nullptr;
     }
-    // Harmony/OpenHarmony 的 napi_create_threadsafe_function 要求 async_resource_name 为合法
-    // 字符串值（不能传 NULL），否则返回 napi_invalid_arg（status=1），导致状态回调永远发不到 JS。
-    napi_value resourceName = nullptr;
-    std::string resName = "deskflow.status";
-    napi_create_string_utf8(env, resName.c_str(), resName.size(), &resourceName);
-    napi_create_threadsafe_function(env, args[0], nullptr, resourceName, 0, 1,
-        nullptr, nullptr, nullptr, DeskflowStatusCallJs, &g_statusTsfn);
+    CreateTsfn(env, args[0], "deskflow.status", DeskflowStatusCallJs, &g_statusTsfn);
     return nullptr;
 }
 
@@ -118,16 +199,15 @@ static napi_value OnClipboardData(napi_env env, napi_callback_info info)
     size_t argc = 1;
     napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) {
+        return nullptr;
+    }
     std::lock_guard<std::mutex> lock(g_tsfnMutex);
     if (g_clipboardTsfn != nullptr) {
         napi_release_threadsafe_function(g_clipboardTsfn, napi_tsfn_release);
         g_clipboardTsfn = nullptr;
     }
-    napi_value resourceName = nullptr;
-    std::string resName = "deskflow.clipboard";
-    napi_create_string_utf8(env, resName.c_str(), resName.size(), &resourceName);
-    napi_create_threadsafe_function(env, args[0], nullptr, resourceName, 0, 1, nullptr, nullptr, nullptr,
-        ClipboardDataCallJs, &g_clipboardTsfn);
+    CreateTsfn(env, args[0], "deskflow.clipboard", ClipboardDataCallJs, &g_clipboardTsfn);
     return nullptr;
 }
 
@@ -142,7 +222,7 @@ static void PublishClipboard(const std::string& text)
     if (tsfn == nullptr) {
         return;
     }
-    napi_call_threadsafe_function(tsfn, new std::string(text), napi_tsfn_nonblocking);
+    CallTsfn(tsfn, new std::string(text));
 }
 
 // setClipboardCallback + pushClipboard 在建立连接时由 NAPI 绑定：
@@ -161,17 +241,17 @@ static napi_value PushClipboard(napi_env env, napi_callback_info info)
     size_t argc = 1;
     napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
-    char buf[1024 * 1024] = {0};
-    size_t len = 0;
-    napi_status st = napi_get_value_string_utf8(env, args[0], buf, sizeof(buf), &len);
-    if (st != napi_ok) {
-        DF_LOGE("PushClipboard: read string fail %{public}d", (int)st);
+    if (argc < 1) {
+        return MakeString(env, "error: pushClipboard requires a text argument");
     }
-    std::string text(buf, len);
+    std::string text;
+    // 1MB 协议字符串上限；动态分配，不再用 1MB 栈缓冲，也不再静默截断。
+    if (!GetStringArg(env, args[0], text, 1024 * 1024)) {
+        DF_LOGE("PushClipboard: read string fail or text too large (>1MB)");
+        return MakeString(env, "error: clipboard text invalid or too large (>1MB)");
+    }
     g_deskflowClient.pushClipboard(text);
-    napi_value result;
-    napi_create_string_utf8(env, "ok", 2, &result);
-    return result;
+    return MakeString(env, "ok");
 }
 
 // setClipboardSync(enable): 开启/关闭剪贴板同步
@@ -181,61 +261,68 @@ static napi_value SetClipboardSync(napi_env env, napi_callback_info info)
     napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
     bool enable = false;
-    napi_get_value_bool(env, args[0], &enable);
+    if (argc < 1 || !GetBoolArg(env, args[0], enable)) {
+        return MakeString(env, "error: setClipboardSync requires a boolean argument");
+    }
     g_deskflowClient.setClipboardSync(enable);
-    napi_value result;
-    napi_create_string_utf8(env, enable ? "clipboard sync ON" : "clipboard sync OFF",
-        enable ? 17 : 18, &result);
-    return result;
+    return MakeString(env, enable ? "clipboard sync ON" : "clipboard sync OFF");
 }
 
 // connectDeskflow(host, port, name, screenW, screenH): 后台线程连接 Deskflow server
+// 参数全部校验，失败即返回 error: ...，不再用默认值静默连接。
+// 旧客户端的停止等待在后台线程做：之前在 JS 线程 sleep 1.5s 会卡 UI。
 static napi_value ConnectDeskflow(napi_env env, napi_callback_info info)
 {
     size_t argc = 5;
     napi_value args[5];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
-    char hostBuf[256] = {0};
-    size_t hostLen = 0;
-    napi_get_value_string_utf8(env, args[0], hostBuf, sizeof(hostBuf), &hostLen);
-    int32_t port = 24800;
-    napi_get_value_int32(env, args[1], &port);
-    char nameBuf[256] = {0};
-    size_t nameLen = 0;
-    napi_get_value_string_utf8(env, args[2], nameBuf, sizeof(nameBuf), &nameLen);
-    int32_t screenW = 1280;
-    int32_t screenH = 800;
-    napi_get_value_int32(env, args[3], &screenW);
-    napi_get_value_int32(env, args[4], &screenH);
-
+    if (argc < 5) {
+        return MakeString(env, "error: connectDeskflow requires host, port, name, screenW, screenH");
+    }
+    std::string host;
+    if (!GetStringArg(env, args[0], host, 253) || host.empty()) {
+        return MakeString(env, "error: invalid host (empty or too long)");
+    }
+    int32_t port = 0;
+    if (!GetIntArg(env, args[1], port) || port < 1 || port > 65535) {
+        return MakeString(env, "error: invalid port (must be 1-65535)");
+    }
+    std::string name;
+    if (!GetStringArg(env, args[2], name, 255) || name.empty()) {
+        return MakeString(env, "error: invalid screen name (empty or too long)");
+    }
+    int32_t screenW = 0, screenH = 0;
+    if (!GetIntArg(env, args[3], screenW) || !GetIntArg(env, args[4], screenH) ||
+        screenW <= 0 || screenH <= 0 || screenW > 16384 || screenH > 16384) {
+        return MakeString(env, "error: invalid screen size (must be 1-16384)");
+    }
+    if (g_connectInProgress.exchange(true)) {
+        return MakeString(env, "error: a connect is already in progress");
+    }
+    DF_LOGI("connectDeskflow: target %{public}s:%{public}d screen %{public}dx%{public}d",
+        host.c_str(), port, screenW, screenH);
     g_deskflowClient.stop();
-    // 等待旧线程退出（最多 1.5 秒），避免 start() 因 m_running 仍为 true 而失败
-    for (int i = 0; i < 15 && g_deskflowClient.isRunning(); ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    DF_LOGI("connectDeskflow: old running=%{public}d, target %{public}s:%{public}d screen %{public}dx%{public}d",
-        g_deskflowClient.isRunning() ? 1 : 0, hostBuf, port, screenW, screenH);
-    if (g_deskflowClient.isRunning()) {
-        // 旧 worker 1.5s 仍未能退出（例如卡在 connect 超时）。不硬启新线程，
-        // 明确提示用户稍后重试，避免静默覆盖/误导。
-        std::string msg = "previous client is still stopping, please retry in a moment";
-        DF_LOGE("%{public}s", msg.c_str());
-        napi_value result;
-        napi_create_string_utf8(env, msg.c_str(), msg.size(), &result);
-        return result;
-    }
-    g_deskflowClient.setStatusCallback(DeskflowStatusCb);
-    g_deskflowClient.setClipboardCallback(DeskflowClipboardCb);
-    g_deskflowClient.setScreenSize(screenW, screenH);
-    // 是否自动重连由桌面侧通过 setAutoReconnect 控制（默认开启，这里不覆盖）
-    bool started = g_deskflowClient.start(hostBuf, static_cast<uint16_t>(port), nameBuf);
-    DF_LOGI("connectDeskflow: started=%{public}d", started ? 1 : 0);
-
-    std::string message = started ? "client starting: " + std::string(hostBuf) + ":" + std::to_string(port)
-                                  : "client already running";
-    napi_value result;
-    napi_create_string_utf8(env, message.c_str(), message.size(), &result);
-    return result;
+    // 后台线程等旧 worker 退出（join）后再启动新连接；JS 线程立即返回。
+    std::thread([host, port, name, screenW, screenH] {
+        g_deskflowClient.waitForExit();
+        if (g_deskflowClient.isRunning()) {
+            DF_LOGE("previous client is still stopping, connect aborted");
+            DeskflowStatusCb("error: previous client is still stopping, please retry in a moment");
+            g_connectInProgress = false;
+            return;
+        }
+        g_deskflowClient.setStatusCallback(DeskflowStatusCb);
+        g_deskflowClient.setClipboardCallback(DeskflowClipboardCb);
+        g_deskflowClient.setScreenSize(screenW, screenH);
+        // 是否自动重连由桌面侧通过 setAutoReconnect 控制（默认开启，这里不覆盖）
+        bool started = g_deskflowClient.start(host, static_cast<uint16_t>(port), name);
+        DF_LOGI("connectDeskflow: started=%{public}d", started ? 1 : 0);
+        if (!started) {
+            DeskflowStatusCb("error: client already running");
+        }
+        g_connectInProgress = false;
+    }).detach();
+    return MakeString(env, "client starting: " + host + ":" + std::to_string(port));
 }
 
 // disconnectDeskflow(): 断开连接
@@ -255,12 +342,12 @@ static napi_value SetInvertScroll(napi_env env, napi_callback_info info)
     napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
     bool invert = false;
-    napi_get_value_bool(env, args[0], &invert);
+    if (argc < 1 || !GetBoolArg(env, args[0], invert)) {
+        return MakeString(env, "error: setInvertScroll requires a boolean argument");
+    }
     g_deskflowClient.setInvertScroll(invert);
-    napi_value result;
-    napi_create_string_utf8(env, invert ? "invert scroll ON" : "invert scroll OFF",
-        invert ? 15 : 16, &result);
-    return result;
+    // 之前硬编码长度 15/16，把 16/17 字符的串截断了 1 字符。
+    return MakeString(env, invert ? "invert scroll ON" : "invert scroll OFF");
 }
 
 // setAutoReconnect(enable): 是否在连接意外断开后自动重连（worker 线程实时读取）
@@ -270,12 +357,11 @@ static napi_value SetAutoReconnect(napi_env env, napi_callback_info info)
     napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
     bool enable = true;
-    napi_get_value_bool(env, args[0], &enable);
+    if (argc < 1 || !GetBoolArg(env, args[0], enable)) {
+        return MakeString(env, "error: setAutoReconnect requires a boolean argument");
+    }
     g_deskflowClient.setAutoReconnect(enable, 3000);
-    napi_value result;
-    napi_create_string_utf8(env, enable ? "auto reconnect ON" : "auto reconnect OFF",
-        enable ? 17 : 18, &result);
-    return result;
+    return MakeString(env, enable ? "auto reconnect ON" : "auto reconnect OFF");
 }
 
 napi_threadsafe_function g_tsfn = nullptr;
@@ -310,7 +396,7 @@ void PublishValue(const std::string& text)
         return;
     }
     // nonblocking：避免在 JS 线程繁忙时阻塞调用线程
-    napi_call_threadsafe_function(tsfn, value, napi_tsfn_nonblocking);
+    CallTsfn(tsfn, value);
 }
 
 
@@ -319,14 +405,18 @@ napi_value OnChange(napi_env env, napi_callback_info info)
     size_t argc = 1;
     napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    if (argc < 1) {
+        return nullptr;
+    }
     std::lock_guard<std::mutex> lock(g_tsfnMutex);
     if (g_tsfn != nullptr) {
         napi_release_threadsafe_function(g_tsfn, napi_tsfn_release);
         g_tsfn = nullptr;
     }
-    // 创建线程安全函数：允许从任意线程（MMI 回调线程）投递事件到 JS 线程
-    napi_create_threadsafe_function(env, args[0], nullptr, nullptr, 0, 1, nullptr, nullptr, nullptr,
-        CallJsOnThread, &g_tsfn);
+    // 创建线程安全函数：允许从任意线程（MMI 回调线程）投递事件到 JS 线程。
+    // 之前这里传 NULL 资源名，按 OnDeskflowStatus 的注释会被 HarmonyOS
+    // 以 napi_invalid_arg 拒绝，导致拦截诊断回调永远发不到 JS。
+    CreateTsfn(env, args[0], "deskflow.change", CallJsOnThread, &g_tsfn);
     return nullptr;
 }
 
@@ -643,8 +733,9 @@ static napi_value InjectMouseClickGlobal(napi_env env, napi_callback_info info)
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
     int32_t x = 0;
     int32_t y = 0;
-    napi_get_value_int32(env, args[0], &x);
-    napi_get_value_int32(env, args[1], &y);
+    if (argc < 2 || !GetIntArg(env, args[0], x) || !GetIntArg(env, args[1], y)) {
+        return MakeString(env, "error: injectMouseClickGlobal requires x, y");
+    }
 
     struct Input_MouseEvent* ev = OH_Input_CreateMouseEvent();
     if (ev == nullptr) {
@@ -686,9 +777,7 @@ static napi_value InjectMouseClickGlobal(napi_env env, napi_callback_info info)
     message += ", up ret: " + std::to_string(ret);
     OH_Input_DestroyMouseEvent(&ev);
 
-    napi_value result;
-    napi_create_string_utf8(env, message.c_str(), message.size(), &result);
-    return result;
+    return MakeString(env, message);
 }
 
 // 只注入一次鼠标移动（不点击），display + global 坐标都设置
@@ -711,13 +800,19 @@ static int32_t InjectMouseMoveTo(int32_t x, int32_t y)
 }
 
 // 平滑移动测试线程：带缓动曲线（ease-out），统计单次注入耗时与失败数
-void MouseTrailThread(int32_t x0, int32_t y0, int32_t x1, int32_t y1, int32_t steps, int32_t intervalMs)
+// generation: 新轨迹启动时旧线程在下一步即退出，不再与新线程抢指针。
+void MouseTrailThread(int32_t x0, int32_t y0, int32_t x1, int32_t y1, int32_t steps, int32_t intervalMs,
+    int32_t generation)
 {
     int64_t totalStepMs = 0;
     int64_t maxStepMs = 0;
     int32_t failCount = 0;
     auto t0 = std::chrono::steady_clock::now();
     for (int32_t i = 1; i <= steps; ++i) {
+        if (g_trailGeneration.load() != generation) {
+            PublishValue("Trail cancelled: superseded by a newer trail");
+            return;
+        }
         // ease-out quad 缓动：起速快、收尾慢，接近真实鼠标移动
         double t = static_cast<double>(i) / steps;
         double eased = 1.0 - (1.0 - t) * (1.0 - t);
@@ -753,19 +848,20 @@ static napi_value InjectMouseTrail(napi_env env, napi_callback_info info)
     napi_value args[6];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
     int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0, steps = 100, intervalMs = 5;
-    napi_get_value_int32(env, args[0], &x0);
-    napi_get_value_int32(env, args[1], &y0);
-    napi_get_value_int32(env, args[2], &x1);
-    napi_get_value_int32(env, args[3], &y1);
-    napi_get_value_int32(env, args[4], &steps);
-    napi_get_value_int32(env, args[5], &intervalMs);
-    std::thread(MouseTrailThread, x0, y0, x1, y1, steps, intervalMs).detach();
+    if (argc < 6 || !GetIntArg(env, args[0], x0) || !GetIntArg(env, args[1], y0) ||
+        !GetIntArg(env, args[2], x1) || !GetIntArg(env, args[3], y1) ||
+        !GetIntArg(env, args[4], steps) || !GetIntArg(env, args[5], intervalMs)) {
+        return MakeString(env, "error: injectMouseTrail requires x0, y0, x1, y1, steps, intervalMs");
+    }
+    if (steps < 1 || steps > 10000 || intervalMs < 0 || intervalMs > 1000) {
+        return MakeString(env, "error: invalid trail steps (1-10000) or intervalMs (0-1000)");
+    }
+    int32_t generation = g_trailGeneration.fetch_add(1) + 1;
+    std::thread(MouseTrailThread, x0, y0, x1, y1, steps, intervalMs, generation).detach();
     std::string message = "Smooth trail started: (" + std::to_string(x0) + "," + std::to_string(y0) +
         ") -> (" + std::to_string(x1) + "," + std::to_string(y1) + "), " +
         std::to_string(steps) + " steps @ " + std::to_string(intervalMs) + "ms";
-    napi_value result;
-    napi_create_string_utf8(env, message.c_str(), message.size(), &result);
-    return result;
+    return MakeString(env, message);
 }
 
 // 注入一次按键（按下 -> 抬起），keyCode 为 Input_KeyCode 键值（如 2015=回车）
@@ -775,14 +871,13 @@ static napi_value InjectKey(napi_env env, napi_callback_info info)
     napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
     int32_t keyCode = 0;
-    napi_get_value_int32(env, args[0], &keyCode);
+    if (argc < 1 || !GetIntArg(env, args[0], keyCode)) {
+        return MakeString(env, "error: injectKey requires a keyCode");
+    }
 
     struct Input_KeyEvent* ke = OH_Input_CreateKeyEvent();
     if (ke == nullptr) {
-        std::string message = "CreateKeyEvent failed";
-        napi_value result;
-        napi_create_string_utf8(env, message.c_str(), message.size(), &result);
-        return result;
+        return MakeString(env, "CreateKeyEvent failed");
     }
     std::string message;
     OH_Input_SetKeyEventAction(ke, KEY_ACTION_DOWN);
@@ -796,9 +891,7 @@ static napi_value InjectKey(napi_env env, napi_callback_info info)
     message += ", up ret: " + std::to_string(ret);
     OH_Input_DestroyKeyEvent(&ke);
 
-    napi_value result;
-    napi_create_string_utf8(env, message.c_str(), message.size(), &result);
-    return result;
+    return MakeString(env, message);
 }
 
 EXTERN_C_START
