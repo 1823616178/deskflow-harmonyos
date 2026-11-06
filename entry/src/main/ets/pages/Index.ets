@@ -14,19 +14,16 @@
  */
 
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { display } from '@kit.ArkUI';
 import { preferences } from '@kit.ArkData';
-import { common, abilityAccessCtrl, Permissions, Want, StartOptions } from '@kit.AbilityKit';
+import { common, Want, StartOptions } from '@kit.AbilityKit';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { commonEventManager } from '@kit.BasicServicesKit';
 import { BusinessError } from '@kit.BasicServicesKit';
-import deskflow from 'libentry.so';
 import { ConnState, StatusBarManager } from '../statusbar/StatusBarManager';
 import { desktopManager } from '../statusbar/DeskflowStatusStore';
-import { BGEVT_STATUS, BGEVT_CLIP, BGEVT_STOP, BGEVT_CLIP_PUSH } from '../background/BackGroundAbility';
+import { BGEVT_STATUS, BGEVT_CLIP, BGEVT_STOP, BGEVT_CLIP_PUSH, BGEVT_SETTINGS } from '../background/BackGroundAbility';
 
 const DOMAIN = 0x0000;
-const READ_PASTEBOARD_PERM: Permissions = 'ohos.permission.READ_PASTEBOARD';
 const PREFS_NAME = 'deskflow_config';
 const PREFS_HOST = 'host';
 const PREFS_PORT = 'port';
@@ -69,32 +66,84 @@ struct Index {
   private lastRemoteClipboard: string = '';
   // 后台承载 Ability 事件订阅器；必须持有引用，否则可能被 GC 回收导致收不到 commonEvent
   private bgSub: commonEventManager.CommonEventSubscriber | null = null;
+  // pasteboard 'update' 监听去重：aboutToAppear 可能多次执行，重复注册
+  // 会导致一次复制推送多次。
+  private clipListenerRegistered: boolean = false;
+  // Preferences 实例缓存：之前每次 load/save 都新建实例。
+  private prefsPromise: Promise<preferences.Preferences> | null = null;
 
-  // 根据服务端状态字符串推断连接状态
-  private mapStatus(s: string): number {
-    if (s === undefined || s === null) {
-      return ConnState.DISCONNECTED;
+  private getPrefs(): Promise<preferences.Preferences> {
+    if (!this.prefsPromise) {
+      const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      this.prefsPromise = preferences.getPreferences(context, PREFS_NAME);
     }
-    const t = s.trim().toLowerCase();
-    if (t.indexOf('error') >= 0 || t.indexOf('closed') >= 0 || t.indexOf('incompatible') >= 0 ||
-      t.indexOf('unknown') >= 0 || t.indexOf('violation') >= 0) {
-      return ConnState.ERROR;
+    return this.prefsPromise;
+  }
+
+  /** 把当前三项设置同步到后台承载进程的原生客户端。之前 UI 进程直接
+   *  调 deskflow.set*，调的是 UI 进程自己的空客户端，连接后改开关无效。 */
+  private publishSettings(): void {
+    try {
+      const payload = JSON.stringify({
+        invert: this.invertScroll,
+        autoReconnect: this.autoReconnect,
+        clipboard: this.clipboardSync
+      });
+      const opts: commonEventManager.CommonEventPublishData = { data: payload };
+      commonEventManager.publish(BGEVT_SETTINGS, opts, (err) => {
+        if (err) {
+          hilog.warn(DOMAIN, 'DeskflowBg', 'settings publish fail: %{public}s', JSON.stringify(err));
+        }
+      });
+    } catch (e) {
+      hilog.warn(DOMAIN, 'DeskflowBg', 'publishSettings error: %{public}s', JSON.stringify(e));
     }
-    if (t.indexOf('active') >= 0 || t.indexOf('control acquired') >= 0) {
-      return ConnState.CONNECTED;
+  }
+
+  /** 校验连接配置：host 非空、端口 1-65535 整数、屏幕名去空格后非空。
+   *  失败返回提示文案，通过返回 null。 */
+  private validateConfig(): string | null {
+    if (this.hostInput.trim().length === 0) {
+      return '请先填写服务端 IP/地址';
     }
-    if (t.indexOf('handshake ok') >= 0 || t.indexOf('reconnect') >= 0 ||
-      t.indexOf('waiting for enter') >= 0) {
-      return ConnState.CONNECTED; // 已握手并进入运行期
+    const portNum = Number(this.portInput);
+    if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+      return '端口无效，应为 1-65535 的整数';
     }
-    if (t.indexOf('connecting') >= 0 || t.indexOf('connect failed') >= 0) {
-      return ConnState.CONNECTING;
+    if (this.screenName.trim().length === 0) {
+      return '请填写屏幕名（需与服务端配置一致）';
     }
-    if (t.indexOf('disconnected') >= 0) {
-      return ConnState.DISCONNECTED;
+    if (this.screenName.trim().length > 64) {
+      return '屏幕名过长（最多 64 字符）';
     }
-    // 默认保持当前状态
-    return this.connState;
+    return null;
+  }
+
+  // 后台承载进程已把状态映射为结构化 code（见 BackGroundAbility.statusCode），
+  // 这里按 code 切换，不再靠字符串包含猜测。之前 'reconnecting in 3000ms'
+  // 含 'reconnect' 会被误判为 CONNECTED，托盘在未连上时变绿。
+  private mapStatusCode(code: string): number {
+    switch (code) {
+      case 'connecting': return ConnState.CONNECTING;
+      case 'connected': return ConnState.CONNECTED;
+      case 'error': return ConnState.ERROR;
+      case 'disconnected': return ConnState.DISCONNECTED;
+      default: return this.connState;
+    }
+  }
+
+  // 解析后台广播的状态 payload：JSON {code, message}；解析失败时按原样
+  // 当作纯文本消息显示，状态保持当前值（兼容旧版承载进程）。
+  private parseStatusPayload(raw: string): { code: string, message: string } {
+    try {
+      const parsed = JSON.parse(raw) as Record<string, string>;
+      if (typeof parsed.code === 'string' && typeof parsed.message === 'string') {
+        return { code: parsed.code, message: parsed.message };
+      }
+    } catch (e) {
+      // 非 JSON：旧版纯文本状态
+    }
+    return { code: '', message: raw };
   }
 
   aboutToAppear(): void {
@@ -106,14 +155,19 @@ struct Index {
     this.subscribeBgEvents();
     // 监听本机剪贴板变化：检测到真实的本地复制时立即推给服务端。
     // 用 pasteboard 'update' 监听比等 COUT 离开屏幕更可靠（服务端离开时不一定发 COUT 给我们）。
-    try {
-      pasteboard.getSystemPasteboard().on('update', () => {
-        if (this.clipboardSync) {
-          this.pushLocalClipboard();
-        }
-      });
-    } catch (e) {
-      hilog.warn(DOMAIN, 'DeskflowClip', 'register pasteboard update listener fail: %{public}s', JSON.stringify(e));
+    // 注意：无 READ_PASTEBOARD 时 getDataSync() 读不到明文，此监听只能在
+    // PasteButton 临时授权窗口内真正推走文本，见 pushLocalClipboard 注释。
+    if (!this.clipListenerRegistered) {
+      try {
+        pasteboard.getSystemPasteboard().on('update', () => {
+          if (this.clipboardSync) {
+            this.pushLocalClipboard();
+          }
+        });
+        this.clipListenerRegistered = true;
+      } catch (e) {
+        hilog.warn(DOMAIN, 'DeskflowClip', 'register pasteboard update listener fail: %{public}s', JSON.stringify(e));
+      }
     }
     // 回填上次保存的连接配置
     this.loadPrefs();
@@ -136,9 +190,11 @@ struct Index {
           return;
         }
         if (data?.event === BGEVT_STATUS) {
-          const value = `${data.data ?? ''}`;
-          this.statusText = value;
-          this.connState = this.mapStatus(value);
+          const parsed = this.parseStatusPayload(`${data.data ?? ''}`);
+          this.statusText = parsed.message;
+          if (parsed.code) {
+            this.connState = this.mapStatusCode(parsed.code);
+          }
           this.syncTray();
         } else if (data?.event === BGEVT_CLIP) {
           const value = `${data.data ?? ''}`;
@@ -155,8 +211,7 @@ struct Index {
   /** 读取上次保存的连接配置（host/port/name/滚轮反转/自动重连） */
   private loadPrefs(): void {
     try {
-      const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
-      preferences.getPreferences(context, PREFS_NAME).then((pref: preferences.Preferences) => {
+      this.getPrefs().then((pref: preferences.Preferences) => {
         this.hostInput = pref.getSync(PREFS_HOST, '') as string;
         this.portInput = pref.getSync(PREFS_PORT, '24800') as string;
         this.screenName = pref.getSync(PREFS_NAME_FIELD, 'HarmonyPC') as string;
@@ -179,15 +234,18 @@ struct Index {
   /** 保存连接配置（下次启动自动回填） */
   private savePrefs(): void {
     try {
-      const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
-      preferences.getPreferences(context, PREFS_NAME).then((pref: preferences.Preferences) => {
+      this.getPrefs().then((pref: preferences.Preferences) => {
         pref.putSync(PREFS_HOST, this.hostInput);
         pref.putSync(PREFS_PORT, this.portInput);
         pref.putSync(PREFS_NAME_FIELD, this.screenName);
         pref.putSync(PREFS_INVERT, this.invertScroll);
         pref.putSync(PREFS_AUTORECONNECT, this.autoReconnect);
         pref.putSync(PREFS_CLIPBOARD, this.clipboardSync);
-        pref.flush();
+        pref.flush().catch((e: Error) => {
+          hilog.error(DOMAIN, 'DeskflowPrefs', 'flush prefs fail: %{public}s', e.message);
+        });
+      }).catch((e: Error) => {
+        hilog.error(DOMAIN, 'DeskflowPrefs', 'save prefs fail: %{public}s', e.message);
       });
     } catch (err) {
       hilog.error(DOMAIN, 'DeskflowPrefs', 'save pref error: %{public}s', JSON.stringify(err));
@@ -202,31 +260,11 @@ struct Index {
 
   // ===== 剪贴板同步 =====
 
-  /** 开启剪贴板同步时向用户请求读取剪贴板权限（鸿蒙要求 ohos.permission.READ_PASTEBOARD） */
-  private requestClipboardPermission(): void {
-    try {
-      const atManager = abilityAccessCtrl.createAtManager();
-      atManager.requestPermissionsFromUser(this.getUIContext().getHostContext() as common.UIAbilityContext,
-        [READ_PASTEBOARD_PERM]).then((data) => {
-          const granted = data.authResults && data.authResults[0] === 0;
-          if (!granted) {
-            this.clipboardSync = false;
-            try {
-              this.statusText = '未授权读取剪贴板，剪贴板同步已关闭';
-            } catch (e) {
-            }
-            this.savePrefs();
-          } else {
-            this.statusText = '剪贴板读取权限已授权';
-          }
-          hilog.info(DOMAIN, 'DeskflowClip', 'request READ_PASTEBOARD granted=%{public}d', granted ? 1 : 0);
-        }).catch((e: Error) => {
-          hilog.warn(DOMAIN, 'DeskflowClip', 'request perm fail: %{public}s', e.message);
-        });
-    } catch (e) {
-      hilog.warn(DOMAIN, 'DeskflowClip', 'requestClipboardPermission error: %{public}s', JSON.stringify(e));
-    }
-  }
+  // 注意：不要在这里请求 ohos.permission.READ_PASTEBOARD。
+  // 该权限未在 module.json5 声明（声明会导致安装失败 9568289，
+  // 见 docs/TROUBLESHOOTING.md §10），请求未声明的受限权限注定
+  // 拿不到，还会把开关偷偷关掉。鸿蒙→Windows 方向只能靠下方的
+  // PasteButton 用户点击授权，见 onPasteButtonClick。
 
   /** 读取系统剪贴板纯文本（供推送用；失败返回空串） */
   private readSystemClipboard(): string {
@@ -269,13 +307,12 @@ struct Index {
         this.statusText = `剪贴板内容已是最新（${text.length} 字符），无需重复同步`;
         return;
       }
-      // 确保同步开启（用户点击即代表期望同步），再把文本推给服务端
+      // 确保同步开启（用户点击即代表期望同步），再把文本推给服务端。
+      // 设置要发给后台承载进程，UI 进程的 deskflow.setClipboardSync
+      // 调的是本进程空客户端，对真实连接无效。
       if (!this.clipboardSync) {
         this.clipboardSync = true;
-        try {
-          deskflow.setClipboardSync(true);
-        } catch (e) {
-        }
+        this.publishSettings();
         this.savePrefs();
       }
       this.pushLocalClipboard(text);
@@ -418,11 +455,8 @@ struct Index {
           .selectedColor('#4CB050')
           .onChange((isOn: boolean) => {
             this.invertScroll = isOn;
-            try {
-              this.statusText = deskflow.setInvertScroll(isOn);
-            } catch (e) {
-              this.statusText = `设置滚轮反转失败: ${JSON.stringify(e)}`;
-            }
+            this.publishSettings();
+            this.statusText = isOn ? '滚轮方向已反转' : '滚轮方向已恢复';
             this.savePrefs();
           })
       }
@@ -437,11 +471,8 @@ struct Index {
           .selectedColor('#4CB050')
           .onChange((isOn: boolean) => {
             this.autoReconnect = isOn;
-            try {
-              this.statusText = deskflow.setAutoReconnect(isOn);
-            } catch (e) {
-              this.statusText = `设置自动重连失败: ${JSON.stringify(e)}`;
-            }
+            this.publishSettings();
+            this.statusText = isOn ? '自动重连已开启' : '自动重连已关闭';
             this.savePrefs();
           })
       }
@@ -461,21 +492,16 @@ struct Index {
           .selectedColor('#4CB050')
           .onChange((isOn: boolean) => {
             this.clipboardSync = isOn;
-            try {
-              this.statusText = deskflow.setClipboardSync(isOn);
-            } catch (e) {
-              this.statusText = `设置剪贴板同步失败: ${JSON.stringify(e)}`;
-            }
+            this.publishSettings();
+            this.statusText = isOn ?
+              '剪贴板同步已开启：鸿蒙→Windows 需点下方“粘贴”按钮手动同步（系统限制，应用无法自动读取剪贴板）' :
+              '剪贴板同步已关闭';
             this.savePrefs();
-            // 开启时向用户请求读取剪贴板权限（鸿蒙要求 READ_PASTEBOARD）
-            if (isOn) {
-              this.requestClipboardPermission();
-            }
           })
       }
       .width('100%')
       .margin({ top: 12 })
-      Text('本机与服务端之间同步剪贴板文本（进入/离开本机屏幕时同步）。')
+      Text('服务端→本机：进入本机屏幕时自动同步；本机→服务端：需点下方“粘贴”按钮手动同步（系统限制）。')
         .fontSize(12)
         .fontColor('#999999')
         .width('100%')
@@ -517,10 +543,14 @@ struct Index {
 
   onConnect(): void {
     try {
-      if (this.hostInput.trim().length === 0) {
-        this.statusText = '请先填写服务端 IP/地址';
+      const validationError = this.validateConfig();
+      if (validationError !== null) {
+        this.statusText = validationError;
+        this.connState = ConnState.ERROR;
+        this.syncTray();
         return;
       }
+      this.screenName = this.screenName.trim();
       // 连接由后台承载 Ability（状态栏项钉定进程）建立，隐藏到托盘时不被冻结。
       const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const want: Want = {

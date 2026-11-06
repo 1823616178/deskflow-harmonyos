@@ -21,8 +21,16 @@ export const BGEVT_STATUS = 'deskflow.bg.status';
 export const BGEVT_CLIP = 'deskflow.bg.clip';
 export const BGEVT_STOP = 'deskflow.bg.stop';
 export const BGEVT_CLIP_PUSH = 'deskflow.bg.clip.push';
+/** 主窗口下发设置变更（滚轮反转/自动重连/剪贴板开关）给承载进程 */
+export const BGEVT_SETTINGS = 'deskflow.bg.settings';
 
 export default class BackGroundAbility extends UIAbility {
+  // 订阅器必须持有引用，否则可能被 GC 回收导致收不到 commonEvent。
+  // 之前这里的 stop/push 订阅器只是 wireEvents() 里的局部变量。
+  private stopSub: commonEventManager.CommonEventSubscriber | null = null;
+  private pushSub: commonEventManager.CommonEventSubscriber | null = null;
+  private settingsSub: commonEventManager.CommonEventSubscriber | null = null;
+
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, TAG, 'BackGroundAbility onCreate');
     const host = want.parameters?.['host'] as string;
@@ -54,11 +62,39 @@ export default class BackGroundAbility extends UIAbility {
     this.wireEvents();
   }
 
+  /**
+   * 把原生层的状态字符串映射为结构化 code，再以 JSON 广播。
+   * 之前 Index.ets 靠 indexOf('error'/'reconnect'/...) 猜状态，
+   * 其中 'reconnecting in 3000ms' 会被误判为 CONNECTED（托盘变绿）。
+   * code: connecting | connected | error | disconnected | unknown
+   */
+  private statusCode(msg: string): string {
+    const t = (msg ?? '').trim().toLowerCase();
+    if (t.indexOf('error') >= 0 || t.indexOf('closed') >= 0 || t.indexOf('incompatible') >= 0 ||
+      t.indexOf('unknown') >= 0 || t.indexOf('violation') >= 0) {
+      return 'error';
+    }
+    if (t.indexOf('reconnecting') >= 0 || t.indexOf('connecting') >= 0 ||
+      t.indexOf('connect failed') >= 0) {
+      return 'connecting';
+    }
+    if (t.indexOf('active') >= 0 || t.indexOf('control acquired') >= 0 ||
+      t.indexOf('handshake ok') >= 0 || t.indexOf('waiting for enter') >= 0) {
+      return 'connected';
+    }
+    if (t.indexOf('disconnected') >= 0) {
+      return 'disconnected';
+    }
+    return 'unknown';
+  }
+
   private wireEvents(): void {
     try {
       deskflow.onDeskflowStatus((event: deskflow.ValueChangeEvent) => {
-        const msg: commonEventManager.CommonEventData = { event: BGEVT_STATUS, data: event.value };
-        this.publish(msg);
+        const msg = event.value ?? '';
+        const payload = JSON.stringify({ code: this.statusCode(msg), message: msg });
+        const data: commonEventManager.CommonEventData = { event: BGEVT_STATUS, data: payload };
+        this.publish(data);
       });
     } catch (e) {
       hilog.error(DOMAIN, TAG, 'status cb fail: %{public}s', JSON.stringify(e));
@@ -74,39 +110,75 @@ export default class BackGroundAbility extends UIAbility {
     }
     // 订阅「断开」事件：主窗口触发时停止后台承载
     try {
-      const info: commonEventManager.CommonEventSubscribeInfo = { events: [BGEVT_STOP] };
-      const sub = commonEventManager.createSubscriberSync(info);
-      commonEventManager.subscribe(sub, (err, data) => {
-        if (!err) {
-          hilog.info(DOMAIN, TAG, 'stop request received');
-          this.context.terminateSelf().catch((e: BusinessError) => {
-            hilog.error(DOMAIN, TAG, 'terminateSelf fail: %{public}s', JSON.stringify(e));
-          });
-        }
-      });
+      if (!this.stopSub) {
+        const info: commonEventManager.CommonEventSubscribeInfo = { events: [BGEVT_STOP] };
+        this.stopSub = commonEventManager.createSubscriberSync(info);
+        commonEventManager.subscribe(this.stopSub, (err, data) => {
+          if (!err) {
+            hilog.info(DOMAIN, TAG, 'stop request received');
+            this.context.terminateSelf().catch((e: BusinessError) => {
+              hilog.error(DOMAIN, TAG, 'terminateSelf fail: %{public}s', JSON.stringify(e));
+            });
+          }
+        });
+      }
     } catch (e) {
       hilog.error(DOMAIN, TAG, 'stop sub fail: %{public}s', JSON.stringify(e));
     }
     // 订阅「推送本机剪贴板」：主窗口把本机剪贴板文本发来，由本进程（持有连接）推给服务端（鸿蒙→Windows）
     try {
-      const pushInfo: commonEventManager.CommonEventSubscribeInfo = { events: [BGEVT_CLIP_PUSH] };
-      const pushSub = commonEventManager.createSubscriberSync(pushInfo);
-      commonEventManager.subscribe(pushSub, (err, data) => {
-        if (!err && data?.data) {
-          const text = `${data.data}`;
-          hilog.info(DOMAIN, TAG, 'clip push request len=%{public}d', text.length);
-          try {
-            // 用户点击 PasteButton 即代表期望同步，确保本进程同步开关打开再推
-            deskflow.setClipboardSync(true);
-            deskflow.pushClipboard(text);
-            hilog.info(DOMAIN, TAG, 'clip pushed to server ok');
-          } catch (e) {
-            hilog.error(DOMAIN, TAG, 'pushClipboard fail: %{public}s', JSON.stringify(e));
+      if (!this.pushSub) {
+        const pushInfo: commonEventManager.CommonEventSubscribeInfo = { events: [BGEVT_CLIP_PUSH] };
+        this.pushSub = commonEventManager.createSubscriberSync(pushInfo);
+        commonEventManager.subscribe(this.pushSub, (err, data) => {
+          if (!err && data?.data) {
+            const text = `${data.data}`;
+            hilog.info(DOMAIN, TAG, 'clip push request len=%{public}d', text.length);
+            try {
+              // 这是用户已授权的显式推送（PasteButton 点击或 UI 侧已门控的
+              // 剪贴板变化），直接推，不再无条件 setClipboardSync(true)
+              // 绕过用户在 UI 上关掉的开关。
+              deskflow.pushClipboard(text);
+              hilog.info(DOMAIN, TAG, 'clip pushed to server ok');
+            } catch (e) {
+              hilog.error(DOMAIN, TAG, 'pushClipboard fail: %{public}s', JSON.stringify(e));
+            }
           }
-        }
-      });
+        });
+      }
     } catch (e) {
       hilog.error(DOMAIN, TAG, 'clip push sub fail: %{public}s', JSON.stringify(e));
+    }
+    // 订阅「设置变更」：主窗口改开关后，把设置同步到本进程的原生客户端。
+    // 之前 UI 进程直接调 deskflow.set*，调的是 UI 进程自己的空客户端，
+    // 连接后改开关当次完全不生效。
+    try {
+      if (!this.settingsSub) {
+        const settingsInfo: commonEventManager.CommonEventSubscribeInfo = { events: [BGEVT_SETTINGS] };
+        this.settingsSub = commonEventManager.createSubscriberSync(settingsInfo);
+        commonEventManager.subscribe(this.settingsSub, (err, data) => {
+          if (err || !data?.data) {
+            return;
+          }
+          try {
+            const settings = JSON.parse(`${data.data}`) as Record<string, boolean>;
+            if (typeof settings.invert === 'boolean') {
+              deskflow.setInvertScroll(settings.invert);
+            }
+            if (typeof settings.autoReconnect === 'boolean') {
+              deskflow.setAutoReconnect(settings.autoReconnect);
+            }
+            if (typeof settings.clipboard === 'boolean') {
+              deskflow.setClipboardSync(settings.clipboard);
+            }
+            hilog.info(DOMAIN, TAG, 'settings applied: %{public}s', `${data.data}`);
+          } catch (e) {
+            hilog.error(DOMAIN, TAG, 'settings parse fail: %{public}s', JSON.stringify(e));
+          }
+        });
+      }
+    } catch (e) {
+      hilog.error(DOMAIN, TAG, 'settings sub fail: %{public}s', JSON.stringify(e));
     }
   }
 
@@ -129,6 +201,23 @@ export default class BackGroundAbility extends UIAbility {
       deskflow.disconnectDeskflow();
     } catch (e) {
       hilog.error(DOMAIN, TAG, 'disconnect fail: %{public}s', JSON.stringify(e));
+    }
+    // 反注册，避免残留订阅器
+    try {
+      if (this.stopSub) {
+        commonEventManager.unsubscribe(this.stopSub);
+        this.stopSub = null;
+      }
+      if (this.pushSub) {
+        commonEventManager.unsubscribe(this.pushSub);
+        this.pushSub = null;
+      }
+      if (this.settingsSub) {
+        commonEventManager.unsubscribe(this.settingsSub);
+        this.settingsSub = null;
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'unsubscribe fail: %{public}s', JSON.stringify(e));
     }
   }
 }

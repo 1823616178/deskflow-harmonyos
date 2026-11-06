@@ -32,6 +32,13 @@ class DeskflowStatusStore {
   registerStateListener(fn: StateListener): void {
     this.listeners.push(fn);
   }
+
+  unregisterStateListener(fn: StateListener): void {
+    const index = this.listeners.indexOf(fn);
+    if (index >= 0) {
+      this.listeners.splice(index, 1);
+    }
+  }
 }
 
 export const desktopManager = new DeskflowStatusStore();

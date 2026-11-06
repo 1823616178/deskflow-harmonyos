@@ -19,7 +19,7 @@ import { window } from '@kit.ArkUI';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { StatusBarManager, ConnState } from '../statusbar/StatusBarManager';
 
-const DOMAIN = 0x0000;
+const DOMAIN = 0xD002;
 
 export default class EntryAbility extends UIAbility {
   private mainWindow: window.Window | null = null;
@@ -28,7 +28,7 @@ export default class EntryAbility extends UIAbility {
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
     } catch (err) {
-      hilog.error(DOMAIN, 'testTag', 'Failed to set colorMode. Cause: %{public}s', JSON.stringify(err));
+      hilog.error(DOMAIN, 'DeskflowEntry', 'Failed to set colorMode. Cause: %{public}s', JSON.stringify(err));
     }
     // 初始化状态栏托盘（桌面扩展，2in1 生效）
     try {
@@ -43,27 +43,29 @@ export default class EntryAbility extends UIAbility {
       };
       // 系统右键菜单自带「退出」，无需自定义 onExitClick。
       // 延迟到窗口就绪后加入
-      sb.add();
+      sb.add().catch((e: BusinessError) => {
+        hilog.error(DOMAIN, 'DeskflowEntry', 'tray add failed: %{public}s', JSON.stringify(e));
+      });
     } catch (err) {
       hilog.error(DOMAIN, 'DeskflowStatusBar', 'tray init failed: %{public}s', JSON.stringify(err));
     }
-    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
+    hilog.info(DOMAIN, 'DeskflowEntry', '%{public}s', 'Ability onCreate');
   }
 
   onDestroy(): void {
-    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onDestroy');
+    hilog.info(DOMAIN, 'DeskflowEntry', '%{public}s', 'Ability onDestroy');
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
     // Main window is created, set main page for this ability
-    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onWindowStageCreate');
+    hilog.info(DOMAIN, 'DeskflowEntry', '%{public}s', 'Ability onWindowStageCreate');
 
     windowStage.loadContent('pages/Index', (err) => {
       if (err.code) {
-        hilog.error(DOMAIN, 'testTag', 'Failed to load the content. Cause: %{public}s', JSON.stringify(err));
+        hilog.error(DOMAIN, 'DeskflowEntry', 'Failed to load the content. Cause: %{public}s', JSON.stringify(err));
         return;
       }
-      hilog.info(DOMAIN, 'testTag', 'Succeeded in loading the content.');
+      hilog.info(DOMAIN, 'DeskflowEntry', 'Succeeded in loading the content.');
     });
 
     // 记录主窗口，并点击系统标题栏「关闭」按钮 → 隐藏到托盘（不退出），
@@ -112,16 +114,16 @@ export default class EntryAbility extends UIAbility {
 
   onWindowStageDestroy(): void {
     // Main window is destroyed, release UI related resources
-    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onWindowStageDestroy');
+    hilog.info(DOMAIN, 'DeskflowEntry', '%{public}s', 'Ability onWindowStageDestroy');
   }
 
   onForeground(): void {
     // Ability has brought to foreground
-    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onForeground');
+    hilog.info(DOMAIN, 'DeskflowEntry', '%{public}s', 'Ability onForeground');
   }
 
   onBackground(): void {
     // Ability has back to background
-    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onBackground');
+    hilog.info(DOMAIN, 'DeskflowEntry', '%{public}s', 'Ability onBackground');
   }
 }

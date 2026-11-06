@@ -3,21 +3,86 @@
  * SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
  */
 
+import { commonEventManager } from '@kit.BasicServicesKit';
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import { desktopManager } from '../statusbar/DeskflowStatusStore';
+import { ConnState } from '../statusbar/StatusBarManager';
+import { BGEVT_STATUS } from '../background/BackGroundAbility';
+
+const DOMAIN = 0xD002;
 
 @Entry
 @Component
 struct StatusBarQuickView {
-  @State state: number = 0;
+  @State state: number = ConnState.DISCONNECTED;
   @State statusText: string = '未连接';
+  // commonEvent 订阅器必须持有引用，否则可能被 GC 回收；
+  // aboutToDisappear 时反注册，避免监听器越积越多。
+  private bgSub: commonEventManager.CommonEventSubscriber | null = null;
+  private stateListener: ((s: number, t: string) => void) | null = null;
 
   aboutToAppear(): void {
-    desktopManager.registerStateListener((s: number, t: string) => {
+    this.stateListener = (s: number, t: string) => {
       this.state = s;
       this.statusText = t;
-    });
+    };
+    desktopManager.registerStateListener(this.stateListener);
     this.state = desktopManager.getState();
     this.statusText = desktopManager.getStatusText();
+    // 托盘快览扩展与主进程不在同一进程，模块级单例 desktopManager
+    // 并不共享，之前这里永远显示初始值“未连接”。改走后台广播拿状态。
+    try {
+      if (!this.bgSub) {
+        const info: commonEventManager.CommonEventSubscribeInfo = { events: [BGEVT_STATUS] };
+        this.bgSub = commonEventManager.createSubscriberSync(info);
+        commonEventManager.subscribe(this.bgSub, (err, data) => {
+          if (err || !data?.data) {
+            return;
+          }
+          try {
+            const parsed = JSON.parse(`${data.data}`) as Record<string, string>;
+            if (typeof parsed.message === 'string') {
+              this.statusText = parsed.message;
+            }
+            switch (parsed.code) {
+              case 'connecting':
+                this.state = ConnState.CONNECTING;
+                break;
+              case 'connected':
+                this.state = ConnState.CONNECTED;
+                break;
+              case 'error':
+                this.state = ConnState.ERROR;
+                break;
+              case 'disconnected':
+                this.state = ConnState.DISCONNECTED;
+                break;
+              default:
+                break;
+            }
+          } catch (e) {
+            hilog.warn(DOMAIN, 'DeskflowStatusBar', 'quick view status parse fail: %{public}s', JSON.stringify(e));
+          }
+        });
+      }
+    } catch (e) {
+      hilog.warn(DOMAIN, 'DeskflowStatusBar', 'quick view subscribe fail: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  aboutToDisappear(): void {
+    if (this.stateListener) {
+      desktopManager.unregisterStateListener(this.stateListener);
+      this.stateListener = null;
+    }
+    if (this.bgSub) {
+      try {
+        commonEventManager.unsubscribe(this.bgSub);
+      } catch (e) {
+        // 忽略反注册失败
+      }
+      this.bgSub = null;
+    }
   }
 
   build() {
@@ -28,7 +93,7 @@ struct StatusBarQuickView {
       Text(this.statusText)
         .fontSize(13)
         .fontColor(
-          this.state === 2 ? '#4CB050' : this.state === 3 ? '#F44336' : '#666666'
+          this.state === ConnState.CONNECTED ? '#4CB050' : this.state === ConnState.ERROR ? '#F44336' : '#666666'
         )
       Text('点右键菜单可：打开主界面 / 连接 / 断开')
         .fontSize(11)
