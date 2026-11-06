@@ -30,6 +30,8 @@ export default class BackGroundAbility extends UIAbility {
   private stopSub: commonEventManager.CommonEventSubscriber | null = null;
   private pushSub: commonEventManager.CommonEventSubscriber | null = null;
   private settingsSub: commonEventManager.CommonEventSubscriber | null = null;
+  // 分片剪贴板重组：id -> {parts, total, received, receivedAt}
+  private clipChunks: Map<string, { parts: string[], total: number, received: number, receivedAt: number }> = new Map();
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, TAG, 'BackGroundAbility onCreate');
@@ -132,7 +134,11 @@ export default class BackGroundAbility extends UIAbility {
         this.pushSub = commonEventManager.createSubscriberSync(pushInfo);
         commonEventManager.subscribe(this.pushSub, (err, data) => {
           if (!err && data?.data) {
-            const text = `${data.data}`;
+            // 分片文本先重组，组装完成才推；单片文本直接推。
+            const text = this.reassembleClipChunk(`${data.data}`);
+            if (text === null) {
+              return; // 还在等后续分片
+            }
             hilog.info(DOMAIN, TAG, 'clip push request len=%{public}d', text.length);
             try {
               // 这是用户已授权的显式推送（PasteButton 点击或 UI 侧已门控的
@@ -180,6 +186,55 @@ export default class BackGroundAbility extends UIAbility {
     } catch (e) {
       hilog.error(DOMAIN, TAG, 'settings sub fail: %{public}s', JSON.stringify(e));
     }
+  }
+
+  /**
+   * 分片剪贴板重组：收到完整分片返回组装后的文本；收到分片但未齐时
+   * 返回 null；收到非分片文本直接原样返回。超时 30s 未齐的分片丢弃。
+   */
+  private reassembleClipChunk(raw: string): string | null {
+    let parsed: Record<string, unknown> | null = null;
+    try {
+      const obj = JSON.parse(raw) as Record<string, unknown>;
+      if (obj.clipChunk === true) {
+        parsed = obj;
+      }
+    } catch (e) {
+      // 非 JSON：普通单片文本
+    }
+    if (parsed === null) {
+      return raw;
+    }
+    const id = `${parsed.id ?? ''}`;
+    const index = Number(parsed.index);
+    const total = Number(parsed.total);
+    const chunk = `${parsed.data ?? ''}`;
+    if (!id || !Number.isInteger(index) || !Number.isInteger(total) || total < 1 || total > 16 || index < 0 || index >= total) {
+      hilog.warn(DOMAIN, TAG, 'bad clip chunk header, dropping');
+      return null;
+    }
+    const now = Date.now();
+    // 清理超时未齐的分片，避免内存残留
+    this.clipChunks.forEach((entry, key) => {
+      if (now - entry.receivedAt > 30000) {
+        this.clipChunks.delete(key);
+      }
+    });
+    let entry = this.clipChunks.get(id);
+    if (!entry) {
+      entry = { parts: new Array<string>(total).fill(''), total: total, received: 0, receivedAt: now };
+      this.clipChunks.set(id, entry);
+    }
+    if (entry.parts[index] === '') {
+      entry.received++;
+    }
+    entry.parts[index] = chunk;
+    entry.receivedAt = now;
+    if (entry.received < total) {
+      return null;
+    }
+    this.clipChunks.delete(id);
+    return entry.parts.join('');
   }
 
   private publish(msg: commonEventManager.CommonEventData): void {

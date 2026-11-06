@@ -351,18 +351,40 @@ struct Index {
     }
     const text = givenText !== undefined ? givenText : this.readSystemClipboard();
     if (text && text.length > 0 && text !== this.lastRemoteClipboard) {
-      try {
-        // 把文本交给后台承载能力（持有连接）推给服务端
+      this.publishClipText(text);
+    }
+  }
+
+  // commonEvent 单条 data 有大小限制，大文本（接近 1MB）直接发可能静默
+  // 失败。超过 64KB 时按 64KB 分片发，后台承载进程重组后再推给服务端。
+  private static readonly CLIP_CHUNK_SIZE = 65536;
+
+  /** 把本机剪贴板文本通过 commonEvent 发给后台承载进程（由它推给服务端） */
+  private publishClipText(text: string): void {
+    try {
+      if (text.length <= Index.CLIP_CHUNK_SIZE) {
         const opts: commonEventManager.CommonEventPublishData = { data: text };
         commonEventManager.publish(BGEVT_CLIP_PUSH, opts, (err) => {
           if (err) {
             hilog.warn(DOMAIN, 'DeskflowClip', 'clip push publish fail: %{public}s', JSON.stringify(err));
           }
         });
-        hilog.info(DOMAIN, 'DeskflowClip', 'push local clipboard len=%{public}d (via BG event)', text.length);
-      } catch (e) {
-        hilog.warn(DOMAIN, 'DeskflowClip', 'push clipboard fail: %{public}s', JSON.stringify(e));
+      } else {
+        const id = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
+        const total = Math.ceil(text.length / Index.CLIP_CHUNK_SIZE);
+        for (let i = 0; i < total; i++) {
+          const chunk = text.substring(i * Index.CLIP_CHUNK_SIZE, (i + 1) * Index.CLIP_CHUNK_SIZE);
+          const payload = JSON.stringify({ clipChunk: true, id: id, index: i, total: total, data: chunk });
+          commonEventManager.publish(BGEVT_CLIP_PUSH, { data: payload }, (err) => {
+            if (err) {
+              hilog.error(DOMAIN, 'DeskflowClip', 'publish clipboard chunk fail: %{public}s', JSON.stringify(err));
+            }
+          });
+        }
       }
+      hilog.info(DOMAIN, 'DeskflowClip', 'push local clipboard len=%{public}d (via BG event)', text.length);
+    } catch (e) {
+      hilog.warn(DOMAIN, 'DeskflowClip', 'push clipboard fail: %{public}s', JSON.stringify(e));
     }
   }
 
