@@ -13,14 +13,19 @@
  * limitations under the License.
  */
 
+// NOTE: the old NDKInputEventInterceptor sample buttons ('Add key event
+// interceptor' etc.) no longer exist in Index.ets. These tests now assert
+// the current Deskflow UI (title, connection section, clipboard toggle,
+// Connect/Disconnect buttons). Interceptor diagnostics are NAPI-only;
+// see docs/ARCHITECTURE.md §3.3.
 import AbilityDelegatorRegistry from '@ohos.app.ability.abilityDelegatorRegistry';
 import { describe, it, expect } from '@ohos/hypium';
 import { Driver, ON } from '@ohos.UiTest';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 
-const TAG = '[Sample_NDKInputEventInterceptorAPI]';
+const TAG = '[Deskflow]';
 const DOMAIN = 0xF811;
-const BUNDLE = 'NDKInputEventInterceptorAPI_';
+const BUNDLE = 'Deskflow_';
 
 export default function abilityTest() {
   describe('ActsAbilityTest', () => {
@@ -41,10 +46,10 @@ export default function abilityTest() {
         expect().assertFail();
       }
       await driver.delayMs(3000);
-      await driver.assertComponentExist(ON.text('Add key event interceptor'));
-      await driver.assertComponentExist(ON.text('Remove key event interceptor'));
-      await driver.assertComponentExist(ON.text('Add input event interceptor. Input event include: mouse event, touch event, and axis event'));
-      await driver.assertComponentExist(ON.text('Remove input event interceptor. include: mouse event, touch event, and axis event'));
+      await driver.assertComponentExist(ON.text('Deskflow'));
+      await driver.assertComponentExist(ON.text('服务端连接'));
+      await driver.assertComponentExist(ON.text('剪贴板同步'));
+      await driver.assertComponentExist(ON.text('连接'));
       done();
       hilog.info(DOMAIN, TAG, BUNDLE + 'StartAbility_001 end')
     })
@@ -52,7 +57,7 @@ export default function abilityTest() {
     /**
      * 添加按键事件拦截
      */
-    it('NDKInputEventInterceptorAPI_addKeyEventInterceptor_001', 0, async (done: Function) => {
+    it('Deskflow_Connect_001', 0, async (done: Function) => {
       hilog.info(DOMAIN, TAG, BUNDLE + 'addKeyEventInterceptor_001, begin');
       let driver = Driver.create();
       let abilityDelegator = AbilityDelegatorRegistry.getAbilityDelegator();
@@ -66,8 +71,8 @@ export default function abilityTest() {
         expect().assertFail();
       }
       await driver.delayMs(3000);
-      await driver.assertComponentExist(ON.text('Add key event interceptor'));
-      let button = await driver.findComponent(ON.text('Add key event interceptor'));
+      await driver.assertComponentExist(ON.text('Deskflow'));
+      let button = await driver.findComponent(ON.text('连接'));
       await button.click();
       await driver.delayMs(3000);
       done();
@@ -77,7 +82,7 @@ export default function abilityTest() {
     /**
      * 移除按键事件拦截
      */
-    it('NDKInputEventInterceptorAPI_removeKeyEventInterceptor_001', 0, async (done: Function) => {
+    it('Deskflow_Disconnect_001', 0, async (done: Function) => {
       hilog.info(DOMAIN, TAG, BUNDLE + 'removeKeyEventInterceptor_001, begin');
       let driver = Driver.create();
       let abilityDelegator = AbilityDelegatorRegistry.getAbilityDelegator();
@@ -91,8 +96,8 @@ export default function abilityTest() {
         expect().assertFail();
       }
       await driver.delayMs(3000);
-      await driver.assertComponentExist(ON.text('Remove key event interceptor'));
-      let button = await driver.findComponent(ON.text('Remove key event interceptor'));
+      await driver.assertComponentExist(ON.text('服务端连接'));
+      let button = await driver.findComponent(ON.text('断开'));
       await button.click();
       await driver.delayMs(3000);
       done();
@@ -102,7 +107,7 @@ export default function abilityTest() {
     /**
      * 添加输入事件拦截
      */
-    it('NDKInputEventInterceptorAPI_addEventInterceptor_001', 0, async (done: Function) => {
+    it('Deskflow_Connect_002', 0, async (done: Function) => {
       hilog.info(DOMAIN, TAG, BUNDLE + 'addEventInterceptor_001, begin');
       let driver = Driver.create();
       let abilityDelegator = AbilityDelegatorRegistry.getAbilityDelegator();
@@ -116,8 +121,8 @@ export default function abilityTest() {
         expect().assertFail();
       }
       await driver.delayMs(3000);
-      await driver.assertComponentExist(ON.text('Add input event interceptor. Input event include: mouse event, touch event, and axis event'));
-      let button = await driver.findComponent(ON.text('Add input event interceptor. Input event include: mouse event, touch event, and axis event'));
+      await driver.assertComponentExist(ON.text('剪贴板同步'));
+      let button = await driver.findComponent(ON.text('连接'));
       await button.click();
       await driver.delayMs(3000);
       done();
@@ -127,7 +132,7 @@ export default function abilityTest() {
     /**
      * 添加输入事件拦截
      */
-    it('NDKInputEventInterceptorAPI_removeEventInterceptor_001', 0, async (done: Function) => {
+    it('Deskflow_Disconnect_002', 0, async (done: Function) => {
       hilog.info(DOMAIN, TAG, BUNDLE + 'removeEventInterceptor_001, begin');
       let driver = Driver.create();
       let abilityDelegator = AbilityDelegatorRegistry.getAbilityDelegator();
@@ -141,8 +146,8 @@ export default function abilityTest() {
         expect().assertFail();
       }
       await driver.delayMs(3000);
-      await driver.assertComponentExist(ON.text('Remove input event interceptor. include: mouse event, touch event, and axis event'));
-      let button = await driver.findComponent(ON.text('Remove input event interceptor. include: mouse event, touch event, and axis event'));
+      await driver.assertComponentExist(ON.text('连接'));
+      let button = await driver.findComponent(ON.text('断开'));
       await button.click();
       await driver.delayMs(3000);
       done();

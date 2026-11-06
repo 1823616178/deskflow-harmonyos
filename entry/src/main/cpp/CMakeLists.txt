@@ -16,3 +16,7 @@ add_library(entry SHARED napi_init.cpp
             protocol/socket_stream.cpp
             protocol/deskflow_client.cpp)
 target_link_libraries(entry PUBLIC libace_napi.z.so libohinput.so libhilog_ndk.z.so)
+
+# Warn loudly, but do not fail the build on warnings yet: the pre-existing
+# NAPI entry points have unused parameters by signature.
+target_compile_options(entry PRIVATE -Wall -Wextra)
