@@ -55,6 +55,10 @@ public:
 
     bool isConnected() const { return m_fd >= 0; }
 
+    // True if the most recent socket read failed because SO_RCVTIMEO
+    // fired (peer silent). Cleared on the next successful read/connect.
+    bool readTimedOut() const { return m_readTimedOut; }
+
 private:
     // Socket-only exact read, used by readFrame for the length prefix.
     // Never touches m_buffer.
@@ -63,6 +67,7 @@ private:
     void compactBuffer();
 
     int m_fd;
+    bool m_readTimedOut{false};
     std::vector<uint8_t> m_buffer;
     size_t m_bufferPos;
     // End of the current frame inside m_buffer (== m_buffer.size()

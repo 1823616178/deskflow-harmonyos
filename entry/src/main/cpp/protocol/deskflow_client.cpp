@@ -215,6 +215,63 @@ DeskflowClient::DeskflowClient() = default;
 DeskflowClient::~DeskflowClient()
 {
     stop();
+    waitForExit();
+}
+
+void DeskflowClient::waitForExit()
+{
+    if (m_thread.joinable()) {
+        m_thread.join();
+    }
+}
+
+int64_t DeskflowClient::nowMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+int32_t DeskflowClient::serverOptionValue(uint32_t id, int32_t fallback) const
+{
+    // DSOP options are (id, value) pairs. An odd trailing word is ignored.
+    for (size_t i = 0; i + 1 < m_serverOptions.size(); i += 2) {
+        if (m_serverOptions[i] == id) {
+            return static_cast<int32_t>(m_serverOptions[i + 1]);
+        }
+    }
+    return fallback;
+}
+
+void DeskflowClient::releaseStuckInputs()
+{
+    for (auto& [buttonId, down] : m_mouseButtonsDown) {
+        if (down) {
+            injectMouseButton(buttonId, false);
+        }
+    }
+    for (auto& [keysym, down] : m_keyStates) {
+        if (down) {
+            injectKeyEvent(keysym, false);
+        }
+    }
+}
+
+void DeskflowClient::resetSessionState(bool releaseInputs)
+{
+    if (releaseInputs) {
+        releaseStuckInputs();
+    }
+    m_mouseButtonsDown.clear();
+    m_keyStates.clear();
+    m_active = false;
+    m_handshakeDone = false;
+    m_seqNum = 0;
+    m_clipChunk.active = false;
+    m_clipChunk.buffer.clear();
+    m_clipChunk.expectedSize = 0;
+    m_clipChunk.clipSeq = 0;
+    m_clipChunk.startTimeMs = 0;
+    m_lastFrameTimeMs = nowMs();
 }
 
 bool DeskflowClient::start(const std::string& host, uint16_t port, const std::string& screenName)
@@ -227,8 +284,10 @@ bool DeskflowClient::start(const std::string& host, uint16_t port, const std::st
     m_screenName = screenName;
     m_stopRequested = false;
     m_running = true;
+    // Joinable (not detached): start() refuses while the previous
+    // worker is still running, and the destructor joins, so no thread
+    // can outlive the client and touch its members after destruction.
     m_thread = std::thread([this] { run(); });
-    m_thread.detach();
     return true;
 }
 
@@ -365,6 +424,12 @@ void DeskflowClient::pushClipboard(const std::string& text)
     if (!m_clipboardSync.load() || !m_handshakeDone || text.empty()) {
         return;
     }
+    {
+        std::lock_guard<std::mutex> lock(m_clipboardMutex);
+        if (text == m_lastClipboardText) {
+            return;  // already synced (incl. remote echo) - avoid a loop
+        }
+    }
     grabClipboard();
     sendClipboard(text);
 }
@@ -384,6 +449,7 @@ void DeskflowClient::run()
 {
     // 外层循环：负责重连。run() 由 start() 起的 worker 线程执行一次，
     // 内部在断开后按需重连，直到 stop() 被调用或收到不可重连指示。
+    int32_t failures = 0;
     while (!m_stopRequested.load()) {
         m_shouldReconnect = true;  // 每次新连接开始时重置
 
@@ -394,10 +460,20 @@ void DeskflowClient::run()
             break;
         }
 
-        // 退避重连
-        setStatus("reconnecting in " + std::to_string(m_reconnectIntervalMs.load()) + "ms");
-        DF_LOGI("reconnect in %{public}d ms", m_reconnectIntervalMs.load());
-        int32_t waitMs = m_reconnectIntervalMs.load();
+        // 指数退避重连（3s -> 6s -> 12s -> 24s -> 30s 上限），避免服务端
+        // 宕机时每 3s 固定 hammer；一次成功握手后 failures 清零。
+        ++failures;
+        int32_t base = m_reconnectIntervalMs.load();
+        int32_t waitMs = base;
+        for (int32_t i = 1; i < failures && waitMs < 30000; ++i) {
+            waitMs = std::min(30000, waitMs * 2);
+        }
+        if (shouldContinue && m_handshakeDone) {
+            failures = 0;  // 至少完成过一次握手才断开：不算连续失败
+            waitMs = base;
+        }
+        setStatus("reconnecting in " + std::to_string(waitMs) + "ms");
+        DF_LOGI("reconnect in %{public}d ms (failures=%{public}d)", waitMs, failures);
         for (int32_t waited = 0; waited < waitMs && !m_stopRequested.load(); waited += 100) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
@@ -413,6 +489,7 @@ void DeskflowClient::run()
 // 单次连接生命周期：连接 → 握手 → 消息循环。运行期断开返回 true（可重连），否则 false。
 bool DeskflowClient::runOnce()
 {
+    resetSessionState(false);
     setStatus("connecting to " + m_host + ":" + std::to_string(m_port));
     DF_LOGI("connecting to %{public}s:%{public}d", m_host.c_str(), m_port);
     if (!m_stream.connect(m_host, m_port, 5000)) {
@@ -432,11 +509,16 @@ bool DeskflowClient::runOnce()
     DF_LOGI("handshake ok");
     setStatus("handshake ok, waiting for enter (move mouse to this screen)");
 
-    // 自动申请注入授权（否则 CINN 后的注入事件不会生效）
-    Input_Result authRet = OH_Input_RequestInjection(OnInjectAuthCallback);
-    DF_LOGI("auto request injection auth, ret=%{public}d", authRet);
-    if (authRet != INPUT_SUCCESS && authRet != INPUT_INJECTION_AUTHORIZED) {
-        DF_LOGE("auto injection auth request failed: %{public}d", authRet);
+    // 自动申请注入授权（否则 CINN 后的注入事件不会生效）。
+    // 已授权时不再重复申请，避免每次重连都弹授权窗。
+    Input_InjectionStatus curStatus = UNAUTHORIZED;
+    if (OH_Input_QueryAuthorizedStatus(&curStatus) != INPUT_SUCCESS ||
+        curStatus != AUTHORIZED) {
+        Input_Result authRet = OH_Input_RequestInjection(OnInjectAuthCallback);
+        DF_LOGI("auto request injection auth, ret=%{public}d", authRet);
+        if (authRet != INPUT_SUCCESS && authRet != INPUT_INJECTION_AUTHORIZED) {
+            DF_LOGE("auto injection auth request failed: %{public}d", authRet);
+        }
     }
 
     // message loop -- every message is a length-prefixed frame
@@ -445,13 +527,19 @@ bool DeskflowClient::runOnce()
         std::vector<uint8_t> frame;
         if (!m_stream.readFrame(frame)) {
             if (!m_stopRequested.load()) {
-                DF_LOGE("connection lost while reading frame");
-                setStatus("error: connection lost");
+                if (m_stream.readTimedOut()) {
+                    DF_LOGE("heartbeat timeout: no frame for 10s (no CALV)");
+                    setStatus("error: heartbeat timeout, reconnecting");
+                } else {
+                    DF_LOGE("connection lost while reading frame");
+                    setStatus("error: connection lost");
+                }
             } else {
                 setStatus("disconnected");
             }
             break;
         }
+        m_lastFrameTimeMs = nowMs();
         // parse message key + payload from frame buffer
         m_stream.pushToBuffer(frame.data(), frame.size());
         uint8_t head[4] = {0, 0, 0, 0};
@@ -463,8 +551,9 @@ bool DeskflowClient::runOnce()
         DF_LOGD("recv: %{public}s (frame %{public}zu, bufRemain %{public}zu)",
             key.c_str(), frame.size(), m_stream.bufferRemaining());
         keepGoing = handleMessage(key);
-        // 运行期每条消息处理完后回 CNOP（deskflow client 的 BSD 延迟 ACK 绕开 hack）
-        if (keepGoing && m_handshakeDone) {
+        // 运行期每条消息处理完后回 CNOP（deskflow client 的 BSD 延迟 ACK 绕开 hack）。
+        // CALV 本身已回 CALV，不再多回一个 CNOP。
+        if (keepGoing && m_handshakeDone && key != "CALV") {
             if (!m_stream.writeFrame(reinterpret_cast<const uint8_t*>("CNOP"), 4)) {
                 DF_LOGE("write CNOP failed");
                 keepGoing = false;
@@ -474,6 +563,9 @@ bool DeskflowClient::runOnce()
 
     DF_LOGI("message loop exited (stopRequested=%{public}d)", m_stopRequested.load() ? 1 : 0);
 
+    // 断开时把本地仍按下的键/按钮抬起，避免重连后粘滞；状态本身由
+    // 下一次 runOnce() 开头的 resetSessionState() 清空。
+    releaseStuckInputs();
     m_stream.close();
     // 断开后是否重连：未被 stop，且未被置为不重连（CBYE/EICV）
     return !m_stopRequested.load() && m_shouldReconnect.load();
@@ -508,7 +600,8 @@ bool DeskflowClient::handshake()
         setStatus(oss.str());
         return false;
     }
-    int16_t helloBackMinor = (minor < kProtocolMinorVersion) ? minor : kProtocolMinorVersion;
+    m_protocolMinor = (minor < kProtocolMinorVersion) ? minor : kProtocolMinorVersion;
+    int16_t helloBackMinor = m_protocolMinor;
 
     // Client -> Server: framed HelloBack = name(7) + "%2i%2i%s" (name = screenName)
     std::vector<uint8_t> out;
@@ -524,7 +617,6 @@ bool DeskflowClient::handshake()
 
 bool DeskflowClient::handleMessage(const std::string& key)
 {
-    bool handled = true;
     if (key == kMsgQInfo) {
         // QINF -> respond DINF: x, y, w, h, 0, mx, my
         std::vector<uint8_t> out;
@@ -566,13 +658,19 @@ bool DeskflowClient::handleMessage(const std::string& key)
     }
     if (key == "COUT") {
         m_active = false;
-        // 离开屏幕：清空按钮按下状态（防止粘滞按键/按钮）
+        // 离开屏幕：抬起仍按下的按钮与按键（防止粘滞），再清空状态。
         for (auto& [buttonId, down] : m_mouseButtonsDown) {
             if (down) {
                 injectMouseButton(buttonId, false);
             }
         }
         m_mouseButtonsDown.clear();
+        for (auto& [keysym, down] : m_keyStates) {
+            if (down) {
+                injectKeyEvent(keysym, false);
+            }
+        }
+        m_keyStates.clear();
         setStatus("inactive: moved back to primary screen");
         return true;
     }
@@ -613,7 +711,7 @@ bool DeskflowClient::handleMessage(const std::string& key)
         if (!ProtoUtil::readf(m_stream, "%1i", &button)) {
             return false;
         }
-        DF_LOGI("DMDN button=%{public}u at (%{public}d,%{public}d)", button, m_pointerX.load(), m_pointerY.load());
+        DF_LOGD("DMDN button=%{public}u at (%{public}d,%{public}d)", button, m_pointerX.load(), m_pointerY.load());
         injectMouseButton(button, true);
         return true;
     }
@@ -622,13 +720,19 @@ bool DeskflowClient::handleMessage(const std::string& key)
         if (!ProtoUtil::readf(m_stream, "%1i", &button)) {
             return false;
         }
-        DF_LOGI("DMUP button=%{public}u at (%{public}d,%{public}d)", button, m_pointerX.load(), m_pointerY.load());
+        DF_LOGD("DMUP button=%{public}u at (%{public}d,%{public}d)", button, m_pointerX.load(), m_pointerY.load());
         injectMouseButton(button, false);
         return true;
     }
     if (key == "DMWM") {
         int16_t xDelta = 0, yDelta = 0;
-        if (!ProtoUtil::readf(m_stream, "%2i%2i", &xDelta, &yDelta)) {
+        // 老版本 DMWM1.0 只有 yDelta（帧内剩 2 字节）；新版 2 个（剩 4 字节）。
+        // 按帧剩余长度分发，不按版本号猜，避免读走下一帧。
+        if (m_stream.bufferRemaining() >= 4) {
+            if (!ProtoUtil::readf(m_stream, "%2i%2i", &xDelta, &yDelta)) {
+                return false;
+            }
+        } else if (!ProtoUtil::readf(m_stream, "%2i", &yDelta)) {
             return false;
         }
         injectMouseWheel(xDelta, yDelta);
@@ -636,7 +740,12 @@ bool DeskflowClient::handleMessage(const std::string& key)
     }
     if (key == "DKDN") {
         int16_t id = 0, mask = 0, button = 0;
-        if (!ProtoUtil::readf(m_stream, kMsgDKeyDown + 4, &id, &mask, &button)) {
+        // 老版本 DKDN1.0 只有 id+mask（帧内剩 4 字节）；新版多 button（剩 6 字节）。
+        if (m_stream.bufferRemaining() >= 6) {
+            if (!ProtoUtil::readf(m_stream, kMsgDKeyDown + 4, &id, &mask, &button)) {
+                return false;
+            }
+        } else if (!ProtoUtil::readf(m_stream, kMsgDKeyDown1_0 + 4, &id, &mask)) {
             return false;
         }
         syncModifiers(static_cast<uint32_t>(mask));
@@ -649,7 +758,11 @@ bool DeskflowClient::handleMessage(const std::string& key)
     }
     if (key == "DKUP") {
         int16_t id = 0, mask = 0, button = 0;
-        if (!ProtoUtil::readf(m_stream, kMsgDKeyUp + 4, &id, &mask, &button)) {
+        if (m_stream.bufferRemaining() >= 6) {
+            if (!ProtoUtil::readf(m_stream, kMsgDKeyUp + 4, &id, &mask, &button)) {
+                return false;
+            }
+        } else if (!ProtoUtil::readf(m_stream, kMsgDKeyUp1_0 + 4, &id, &mask)) {
             return false;
         }
         syncModifiers(static_cast<uint32_t>(mask));
@@ -668,9 +781,17 @@ bool DeskflowClient::handleMessage(const std::string& key)
         }
         syncModifiers(static_cast<uint32_t>(mask));
         uint32_t k = static_cast<uint32_t>(id);
+        // 按住重复：count 是自上次以来的重复次数。已按下的键再发 DOWN
+        // 即为系统可识别的重复事件；未按下时先补一次 DOWN。
+        // 上限 32，防止异常 count 引发注入风暴。
+        int32_t repeats = count < 0 ? 0 : (count > 32 ? 32 : count);
         if (!m_keyStates[k]) {
             injectKeyEvent(k, true);
             m_keyStates[k] = true;
+            --repeats;
+        }
+        for (int32_t i = 0; i < repeats; ++i) {
+            injectKeyEvent(k, true);
         }
         return true;
     }
@@ -720,6 +841,18 @@ bool DeskflowClient::handleMessage(const std::string& key)
         if (!ProtoUtil::readf(m_stream, kMsgDSetOptions + 4, &options)) {
             return false;
         }
+        // 之前直接丢弃；现在保留原始选项字，供 serverOptionValue()
+        // 查询与日志排障（数值 id 的上游含义见 docs/PROTOCOL.md，
+        // 未核实的 id 不得据此静默关闭功能）。
+        m_serverOptions = options;
+        {
+            std::ostringstream oss;
+            oss << "DSOP options[" << options.size() << "]:";
+            for (size_t i = 0; i < options.size(); ++i) {
+                oss << " " << options[i];
+            }
+            DF_LOGI("%{public}s", oss.str().c_str());
+        }
         // DSOP 是握手完成的标志：此后进入运行期（每条消息后回 CNOP）
         m_handshakeDone = true;
         DF_LOGI("DSOP received, handshake complete, entering runtime");
@@ -742,6 +875,7 @@ bool DeskflowClient::handleMessage(const std::string& key)
             m_clipChunk.active = true;
             m_clipChunk.buffer.clear();
             m_clipChunk.clipSeq = seq;
+            m_clipChunk.startTimeMs = nowMs();
             try {
                 m_clipChunk.expectedSize = static_cast<size_t>(std::stoull(data));
             } catch (...) {
@@ -758,6 +892,32 @@ bool DeskflowClient::handleMessage(const std::string& key)
         if (mark == kDataChunk) {
             if (!m_clipChunk.active) {
                 DF_LOGI("DCLP data chunk before start");
+                return true;
+            }
+            if (seq != m_clipChunk.clipSeq) {
+                DF_LOGE("DCLP chunk seq mismatch: %{public}u != %{public}u, dropping assembly",
+                    seq, m_clipChunk.clipSeq);
+                m_clipChunk.active = false;
+                m_clipChunk.buffer.clear();
+                return true;
+            }
+            if (nowMs() - m_clipChunk.startTimeMs > 10000) {
+                DF_LOGE("DCLP assembly timed out, dropping");
+                m_clipChunk.active = false;
+                m_clipChunk.buffer.clear();
+                return true;
+            }
+            // 上限：声明大小（若有）与协议字符串上限 1MB，取其小者。
+            // 无上限 append 会让异常服务端用无限分块打爆内存。
+            size_t cap = kProtocolMaxStringLength;
+            if (m_clipChunk.expectedSize > 0 && m_clipChunk.expectedSize < cap) {
+                cap = m_clipChunk.expectedSize;
+            }
+            if (m_clipChunk.buffer.size() + data.size() > cap) {
+                DF_LOGE("DCLP chunk would exceed cap %{public}zu, dropping assembly",
+                    cap);
+                m_clipChunk.active = false;
+                m_clipChunk.buffer.clear();
                 return true;
             }
             m_clipChunk.buffer.append(data);
@@ -782,7 +942,7 @@ bool DeskflowClient::handleMessage(const std::string& key)
                 if (cb) {
                     cb(text);
                 }
-                DF_LOGI("DCLP: assembled %{public}zu bytes, text %{public}zu -> JS", assembled.size(), text.size());
+                DF_LOGD("DCLP: assembled %{public}zu bytes, text %{public}zu -> JS", assembled.size(), text.size());
             } else {
                 DF_LOGD("DCLP: assembled %{public}zu bytes, text %{public}zu, ignored (sync=%{public}d)",
                     assembled.size(), text.size(), m_clipboardSync.load() ? 1 : 0);
@@ -864,6 +1024,9 @@ uint32_t DeskflowClient::maskModifierKeysym(uint32_t maskBit) const
         case kKeyModifierMeta:    return kKeyMetaL;
         case kKeyModifierSuper:   return kKeySuperL;
         case kKeyModifierAltGr:   return kKeyAltR;
+        case kKeyModifierCapsLock: return kKeyCapsLock;
+        case kKeyModifierNumLock: return kKeyNumLock;
+        case kKeyModifierScrollLock: return kKeyScrollLock;
         default: return kKeyNone;
     }
 }
@@ -874,7 +1037,10 @@ void DeskflowClient::syncModifiers(uint32_t mask)
 {
     static const uint32_t kModBits[] = {
         kKeyModifierShift, kKeyModifierControl, kKeyModifierAlt,
-        kKeyModifierMeta, kKeyModifierSuper, kKeyModifierAltGr
+        kKeyModifierMeta, kKeyModifierSuper, kKeyModifierAltGr,
+        // 锁键位与普通修饰键位独立（PROTOCOL.md §7.2），之前被漏掉，
+        // 大小写锁定会在两端漂移。
+        kKeyModifierCapsLock, kKeyModifierNumLock, kKeyModifierScrollLock
     };
     for (uint32_t bit : kModBits) {
         uint32_t keysym = maskModifierKeysym(bit);
@@ -986,8 +1152,23 @@ bool DeskflowClient::injectMouseWheel(int32_t xDelta, int32_t yDelta)
     }
     int32_t x = m_pointerX.load();
     int32_t y = m_pointerY.load();
-    int32_t axisType = (yDelta != 0) ? MOUSE_AXIS_SCROLL_VERTICAL : MOUSE_AXIS_SCROLL_HORIZONTAL;
-    float axisValue = (yDelta != 0) ? static_cast<float>(yDelta) : static_cast<float>(xDelta);
+    // 与 MOVE/BUTTON 一致钳到 [1, W-1]/[1, H-1]：指针在边缘 (0,0)
+    // 时滚轮事件同样会因 401 失败。
+    if (x < 1) x = 1; else if (x > m_screenW - 1) x = m_screenW - 1;
+    if (y < 1) y = 1; else if (y > m_screenH - 1) y = m_screenH - 1;
+    // 对角滚动同时有 x/y 分量时两轴都要发，之前只发了垂直轴。
+    bool ok = true;
+    if (yDelta != 0) {
+        ok = injectMouseWheelAxis(x, y, MOUSE_AXIS_SCROLL_VERTICAL, static_cast<float>(yDelta)) && ok;
+    }
+    if (xDelta != 0) {
+        ok = injectMouseWheelAxis(x, y, MOUSE_AXIS_SCROLL_HORIZONTAL, static_cast<float>(xDelta)) && ok;
+    }
+    return ok;
+}
+
+bool DeskflowClient::injectMouseWheelAxis(int32_t x, int32_t y, int32_t axisType, float axisValue)
+{
     // 滚轮需要完整 AXIS_BEGIN -> AXIS_UPDATE -> AXIS_END 序列（官方 Action 枚举 4/5/6），
     // 只发 UPDATE 系统不识别
     const int32_t actions[3] = { MOUSE_ACTION_AXIS_BEGIN, MOUSE_ACTION_AXIS_UPDATE, MOUSE_ACTION_AXIS_END };
@@ -1030,7 +1211,8 @@ bool DeskflowClient::injectKeyEvent(uint32_t keysym, bool down)
     OH_Input_SetKeyEventActionTime(ke, -1);
     int32_t ret = OH_Input_InjectKeyEvent(ke);
     OH_Input_DestroyKeyEvent(&ke);
-    DF_LOGI("injectKeyEvent keysym=0x%{public}x keyCode=%{public}d %{public}s ret=%{public}d",
+    // 高频路径 + 含按键内容：INFO 会刷屏并把输入写进日志，降为 DEBUG。
+    DF_LOGD("injectKeyEvent keysym=0x%{public}x keyCode=%{public}d %{public}s ret=%{public}d",
         keysym, keyCode, down ? "DOWN" : "UP", ret);
     return ret == INPUT_SUCCESS;
 }

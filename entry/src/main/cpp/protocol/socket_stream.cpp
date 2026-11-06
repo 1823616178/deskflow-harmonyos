@@ -26,7 +26,7 @@ namespace dfpoc {
 constexpr int kRecvTimeoutSec = 10;
 constexpr int kSendTimeoutSec = 5;
 
-SocketStream::SocketStream() : m_fd(-1), m_bufferPos(0), m_frameEnd(0) {}
+SocketStream::SocketStream() : m_fd(-1), m_readTimedOut(false), m_bufferPos(0), m_frameEnd(0) {}
 
 SocketStream::~SocketStream()
 {
@@ -119,6 +119,7 @@ bool SocketStream::connect(const std::string& host, uint16_t port, int timeoutMs
             stv.tv_usec = 0;
             setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof(stv));
             m_fd = fd;
+            m_readTimedOut = false;
             freeaddrinfo(result);
             return true;
         }
@@ -166,6 +167,7 @@ bool SocketStream::readExactSocket(uint8_t* data, size_t n)
         ssize_t rc = ::recv(m_fd, data + got, n - got, 0);
         if (rc > 0) {
             got += static_cast<size_t>(rc);
+            m_readTimedOut = false;
         } else if (rc == 0) {
             return false; // EOF
         } else {
@@ -174,6 +176,9 @@ bool SocketStream::readExactSocket(uint8_t* data, size_t n)
             }
             // EAGAIN/EWOULDBLOCK here means SO_RCVTIMEO fired:
             // the peer is silent (no CALV for 10s) -> treat as dead.
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                m_readTimedOut = true;
+            }
             return false;
         }
     }
