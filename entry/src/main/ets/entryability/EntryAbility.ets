@@ -107,7 +107,7 @@ export default class EntryAbility extends UIAbility {
     }
     // 兜底：拉起新的 Ability 实例
     await this.context.startAbility({
-      bundleName: 'com.deskflow.ohospoc',
+      bundleName: this.context.abilityInfo.bundleName,
       abilityName: 'EntryAbility'
     });
   }

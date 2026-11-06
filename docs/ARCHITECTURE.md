@@ -131,7 +131,7 @@ while (keepGoing && !stop):
 
 ### 4.3 运行期确认
 
-收到 `DSOP` 后 `m_handshakeDone = true`，此后每条消息处理完回一次 `CNOP`，绕开服务端"BSD 延迟 ACK"等待（`PROTOCOL.md` §5）。
+收到 `DSOP` 后 `m_handshakeDone = true`，此后除 `CALV` 外每条消息处理完回一次 `CNOP`；`CALV` 只回复 `CALV`，绕开服务端"BSD 延迟 ACK"等待（`PROTOCOL.md` §5）。
 
 ### 4.4 注入数据流
 

@@ -15,13 +15,15 @@
 
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { preferences } from '@kit.ArkData';
-import { common, Want, StartOptions } from '@kit.AbilityKit';
+import { common, Want, StartOptions, contextConstant } from '@kit.AbilityKit';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { commonEventManager } from '@kit.BasicServicesKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { ConnState, StatusBarManager } from '../statusbar/StatusBarManager';
 import { desktopManager } from '../statusbar/DeskflowStatusStore';
-import { BGEVT_STATUS, BGEVT_CLIP, BGEVT_STOP, BGEVT_CLIP_PUSH, BGEVT_SETTINGS } from '../background/BackGroundAbility';
+import { BGEVT_STATUS, BGEVT_CLIP, BGEVT_STOP, BGEVT_CLIP_PUSH, BGEVT_SETTINGS, BGEVT_READY } from '../background/BackGroundAbility';
+import { DeskflowStatusData } from '../background/DeskflowEventData';
+import { splitClipboardText } from '../background/ClipboardTransfer';
 
 const DOMAIN = 0x0000;
 const PREFS_NAME = 'deskflow_config';
@@ -66,6 +68,7 @@ struct Index {
   private lastRemoteClipboard: string = '';
   // 后台承载 Ability 事件订阅器；必须持有引用，否则可能被 GC 回收导致收不到 commonEvent
   private bgSub: commonEventManager.CommonEventSubscriber | null = null;
+  private startingConnection: boolean = false;
   // pasteboard 'update' 监听去重：aboutToAppear 可能多次执行，重复注册
   // 会导致一次复制推送多次。
   private clipListenerRegistered: boolean = false;
@@ -75,7 +78,10 @@ struct Index {
   private getPrefs(): Promise<preferences.Preferences> {
     if (!this.prefsPromise) {
       const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
-      this.prefsPromise = preferences.getPreferences(context, PREFS_NAME);
+      this.prefsPromise = preferences.getPreferences(context, PREFS_NAME).catch((e: BusinessError) => {
+        this.prefsPromise = null;
+        return Promise.reject(e);
+      });
     }
     return this.prefsPromise;
   }
@@ -93,6 +99,8 @@ struct Index {
       commonEventManager.publish(BGEVT_SETTINGS, opts, (err) => {
         if (err) {
           hilog.warn(DOMAIN, 'DeskflowBg', 'settings publish fail: %{public}s', JSON.stringify(err));
+          this.statusText = '设置同步失败，请重试';
+          this.syncTray();
         }
       });
     } catch (e) {
@@ -134,7 +142,7 @@ struct Index {
 
   // 解析后台广播的状态 payload：JSON {code, message}；解析失败时按原样
   // 当作纯文本消息显示，状态保持当前值（兼容旧版承载进程）。
-  private parseStatusPayload(raw: string): { code: string, message: string } {
+  private parseStatusPayload(raw: string): DeskflowStatusData {
     try {
       const parsed = JSON.parse(raw) as Record<string, string>;
       if (typeof parsed.code === 'string' && typeof parsed.message === 'string') {
@@ -161,7 +169,10 @@ struct Index {
       try {
         pasteboard.getSystemPasteboard().on('update', () => {
           if (this.clipboardSync) {
-            this.pushLocalClipboard();
+            this.pushLocalClipboard().catch((e: BusinessError) => {
+              this.statusText = `剪贴板同步失败: ${e.message}`;
+              hilog.warn(DOMAIN, 'DeskflowClip', 'clipboard publish fail: %{public}s', e.message);
+            });
           }
         });
         this.clipListenerRegistered = true;
@@ -180,7 +191,7 @@ struct Index {
         return; // 已订阅
       }
       const info: commonEventManager.CommonEventSubscribeInfo =
-        { events: [BGEVT_STATUS, BGEVT_CLIP] };
+        { events: [BGEVT_STATUS, BGEVT_CLIP, BGEVT_READY] };
       const sub = commonEventManager.createSubscriberSync(info);
       this.bgSub = sub; // 持有引用，防止 GC 回收导致订阅失效
       hilog.info(DOMAIN, 'DeskflowBg', 'subscribeBgEvents: created subscriber %{public}s', info.events.join(','));
@@ -189,7 +200,9 @@ struct Index {
           hilog.warn(DOMAIN, 'DeskflowBg', 'subscribe fail: %{public}s', JSON.stringify(err));
           return;
         }
-        if (data?.event === BGEVT_STATUS) {
+        if (data?.event === BGEVT_READY) {
+          this.publishSettings(); // replay changes made while the carrier was starting
+        } else if (data?.event === BGEVT_STATUS) {
           const parsed = this.parseStatusPayload(`${data.data ?? ''}`);
           this.statusText = parsed.message;
           if (parsed.code) {
@@ -287,7 +300,7 @@ struct Index {
   }
 
   /** PasteButton 点击回调：用户主动点击后获得剪贴板临时授权，读取并推给服务端（鸿蒙→Windows） */
-  private onPasteButtonClick(result: PasteButtonOnClickResult, err?: BusinessError<void>): void {
+  private async onPasteButtonClick(result: PasteButtonOnClickResult, err?: BusinessError<void>): Promise<void> {
     if (result !== PasteButtonOnClickResult.SUCCESS) {
       const code = err?.code !== undefined ? err.code : '?';
       this.statusText = `此按钮需用户亲自点击才能读取剪贴板（授权失败 ${code}），请重试`;
@@ -315,14 +328,14 @@ struct Index {
         this.publishSettings();
         this.savePrefs();
       }
-      this.pushLocalClipboard(text);
-      this.statusText = `已读取本机剪贴板并同步（${text.length} 字符）`;
+      await this.pushLocalClipboard(text);
+      this.statusText = `已读取本机剪贴板并提交同步（${text.length} 字符）`;
       hilog.info(DOMAIN, 'DeskflowClip', 'PasteButton success, read %{public}d chars', text.length);
     } catch (e) {
       const err2 = e as BusinessError;
       hilog.warn(DOMAIN, 'DeskflowClip', 'PasteButton read fail code=%{public}d msg=%{public}s',
         err2.code, err2.message);
-      this.statusText = `剪贴板读取失败(${err2.code})，请重试`;
+      this.statusText = `剪贴板同步失败: ${err2.message ?? JSON.stringify(e)}`;
     }
   }
 
@@ -345,47 +358,30 @@ struct Index {
    *  因为连接 native 环境在 BackGroundAbility 常驻进程里，新建实例没有已建立的连接。
    *  鸿蒙 6.1 读取系统剪贴板需 READ_PASTEBOARD（声明会导致安装失败 9568289），
    *  普通 getDataSync 拿不到明文，需由 PasteButton 用户点击授权后才有明文。 */
-  private pushLocalClipboard(givenText?: string): void {
+  private async pushLocalClipboard(givenText?: string): Promise<void> {
     if (!this.clipboardSync) {
       return;
     }
     const text = givenText !== undefined ? givenText : this.readSystemClipboard();
     if (text && text.length > 0 && text !== this.lastRemoteClipboard) {
-      this.publishClipText(text);
+      await this.publishClipText(text);
     }
   }
 
-  // commonEvent 单条 data 有大小限制，大文本（接近 1MB）直接发可能静默
-  // 失败。超过 64KB 时按 64KB 分片发，后台承载进程重组后再推给服务端。
-  private static readonly CLIP_CHUNK_SIZE = 65536;
-
   /** 把本机剪贴板文本通过 commonEvent 发给后台承载进程（由它推给服务端） */
-  private publishClipText(text: string): void {
-    try {
-      if (text.length <= Index.CLIP_CHUNK_SIZE) {
-        const opts: commonEventManager.CommonEventPublishData = { data: text };
+  private async publishClipText(text: string): Promise<void> {
+    const id = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
+    const chunks = splitClipboardText(text, id);
+    for (const chunk of chunks) {
+      const opts: commonEventManager.CommonEventPublishData = { data: JSON.stringify(chunk) };
+      await new Promise<void>((resolve, reject) => {
         commonEventManager.publish(BGEVT_CLIP_PUSH, opts, (err) => {
-          if (err) {
-            hilog.warn(DOMAIN, 'DeskflowClip', 'clip push publish fail: %{public}s', JSON.stringify(err));
-          }
+          if (err && err.code) reject(err);
+          else resolve();
         });
-      } else {
-        const id = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
-        const total = Math.ceil(text.length / Index.CLIP_CHUNK_SIZE);
-        for (let i = 0; i < total; i++) {
-          const chunk = text.substring(i * Index.CLIP_CHUNK_SIZE, (i + 1) * Index.CLIP_CHUNK_SIZE);
-          const payload = JSON.stringify({ clipChunk: true, id: id, index: i, total: total, data: chunk });
-          commonEventManager.publish(BGEVT_CLIP_PUSH, { data: payload }, (err) => {
-            if (err) {
-              hilog.error(DOMAIN, 'DeskflowClip', 'publish clipboard chunk fail: %{public}s', JSON.stringify(err));
-            }
-          });
-        }
-      }
-      hilog.info(DOMAIN, 'DeskflowClip', 'push local clipboard len=%{public}d (via BG event)', text.length);
-    } catch (e) {
-      hilog.warn(DOMAIN, 'DeskflowClip', 'push clipboard fail: %{public}s', JSON.stringify(e));
+      });
     }
+    hilog.info(DOMAIN, 'DeskflowClip', 'push local clipboard len=%{public}d (via BG event)', text.length);
   }
 
   @Builder
@@ -563,7 +559,11 @@ struct Index {
     .borderRadius(12)
   }
 
-  onConnect(): void {
+  async onConnect(): Promise<void> {
+    if (this.startingConnection) {
+      return;
+    }
+    this.startingConnection = true;
     try {
       const validationError = this.validateConfig();
       if (validationError !== null) {
@@ -576,7 +576,7 @@ struct Index {
       // 连接由后台承载 Ability（状态栏项钉定进程）建立，隐藏到托盘时不被冻结。
       const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const want: Want = {
-        bundleName: 'com.deskflow.ohospoc',
+        bundleName: context.abilityInfo.bundleName,
         abilityName: 'BackGroundAbility',
         parameters: {
           'host': this.hostInput.trim(),
@@ -587,21 +587,27 @@ struct Index {
           'clipboard': this.clipboardSync
         }
       };
-      this.startBg(want);
       this.connState = ConnState.CONNECTING;
       this.statusText = `正在连接 ${this.hostInput.trim()}:${this.portInput}...`;
+      this.syncTray();
+      await this.startBg(want);
       this.savePrefs();
     } catch (e) {
-      this.statusText = `连接失败: ${JSON.stringify(e)}`;
+      const err = e as BusinessError;
+      this.statusText = `连接失败 (${err.code}): ${err.message ?? JSON.stringify(e)}`;
       this.connState = ConnState.ERROR;
+      hilog.error(DOMAIN, 'DeskflowBg', 'startAbility fail code=%{public}d message=%{public}s',
+        err.code, err.message ?? JSON.stringify(e));
+    } finally {
+      this.startingConnection = false;
     }
     this.syncTray();
   }
 
-  onDisconnect(): void {
+  async onDisconnect(): Promise<void> {
     try {
       // 通过 commonEvent 通知后台承载 Ability 断开并自行终止
-      this.requestBgStop();
+      await this.requestBgStop();
       this.statusText = '正在断开连接...';
       this.connState = ConnState.DISCONNECTED;
       this.syncTray();
@@ -613,40 +619,43 @@ struct Index {
   }
 
   /** 以独立进程方式启动后台承载 Ability（隐藏启动，独立于主窗口进程，避免隐藏时被冻结）。 */
-  private startBg(want: Want): void {
+  private async startBg(want: Want): Promise<void> {
     const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
-    try {
-      // 先停掉可能残留的旧承载进程，避免二次连接命中 16000068（已被占用）而连到旧目标
-      this.requestBgStop();
-      const options: StartOptions = {
-        processMode: 1, // contextConstant.ProcessMode.NEW_PROCESS_ATTACH_TO_PARENT
-        startupVisibility: 0 // contextConstant.StartupVisibility.STARTUP_HIDE
-      };
-      context.startAbility(want, options).catch((e: BusinessError) => {
-        if (e.code === 16000068) {
-          // 承载已运行：旧实例正被请求停止，下一轮重新连接即可。
-          hilog.info(DOMAIN, 'DeskflowBg', 'carrier already running (16000068), will restart');
-          return;
+    // 停止广播发出后有限重试，等待旧进程退出，避免吞掉“已运行”错误后永远不连接。
+    await this.requestBgStop();
+    const options: StartOptions = {
+      processMode: contextConstant.ProcessMode.NEW_PROCESS_ATTACH_TO_PARENT,
+      startupVisibility: contextConstant.StartupVisibility.STARTUP_HIDE
+    };
+    for (let attempt = 0; attempt < 10; attempt++) {
+      try {
+        await context.startAbility(want, options);
+        return;
+      } catch (e) {
+        const err = e as BusinessError;
+        if (err.code !== 16000068 || attempt === 9) {
+          return Promise.reject(err);
         }
-        hilog.warn(DOMAIN, 'DeskflowBg', 'startAbility fail: %{public}s', JSON.stringify(e));
-      });
-    } catch (e) {
-      hilog.warn(DOMAIN, 'DeskflowBg', 'startAbility error: %{public}s', JSON.stringify(e));
+        hilog.info(DOMAIN, 'DeskflowBg', 'waiting for old carrier to stop, retry=%{public}d', attempt + 1);
+        await new Promise<void>((resolve) => {
+          setTimeout(() => resolve(), 200);
+        });
+      }
     }
   }
 
   /** 通知后台承载 Ability 停止（终止旧连接进程） */
-  private requestBgStop(): void {
-    try {
+  private requestBgStop(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
       const opts: commonEventManager.CommonEventPublishData = { data: 'stop' };
       commonEventManager.publish(BGEVT_STOP, opts, (err) => {
-        if (err) {
-          hilog.warn(DOMAIN, 'DeskflowBg', 'stop publish fail: %{public}s', JSON.stringify(err));
+        if (err && err.code) {
+          reject(err);
+        } else {
+          resolve();
         }
       });
-    } catch (e) {
-      hilog.warn(DOMAIN, 'DeskflowBg', 'requestBgStop error: %{public}s', JSON.stringify(e));
-    }
+    });
   }
 
   build() {

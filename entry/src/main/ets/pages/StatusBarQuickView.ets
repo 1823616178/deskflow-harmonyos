@@ -7,7 +7,7 @@ import { commonEventManager } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { desktopManager } from '../statusbar/DeskflowStatusStore';
 import { ConnState } from '../statusbar/StatusBarManager';
-import { BGEVT_STATUS } from '../background/BackGroundAbility';
+import { BGEVT_STATUS, BGEVT_STATUS_REQUEST } from '../background/BackGroundAbility';
 
 const DOMAIN = 0xD002;
 
@@ -63,6 +63,9 @@ struct StatusBarQuickView {
           } catch (e) {
             hilog.warn(DOMAIN, 'DeskflowStatusBar', 'quick view status parse fail: %{public}s', JSON.stringify(e));
           }
+        });
+        commonEventManager.publish(BGEVT_STATUS_REQUEST, { data: 'state' }, (err) => {
+          if (err) hilog.warn(DOMAIN, 'DeskflowStatusBar', 'status request fail: %{public}s', JSON.stringify(err));
         });
       }
     } catch (e) {

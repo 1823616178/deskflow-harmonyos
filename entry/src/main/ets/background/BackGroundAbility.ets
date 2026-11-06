@@ -12,6 +12,7 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { display } from '@kit.ArkUI';
 import deskflow from 'libentry.so';
+import { ClipboardAssembler, ClipboardChunk } from './ClipboardTransfer';
 
 const DOMAIN = 0x0000;
 const TAG = 'DeskflowBG';
@@ -23,6 +24,8 @@ export const BGEVT_STOP = 'deskflow.bg.stop';
 export const BGEVT_CLIP_PUSH = 'deskflow.bg.clip.push';
 /** 主窗口下发设置变更（滚轮反转/自动重连/剪贴板开关）给承载进程 */
 export const BGEVT_SETTINGS = 'deskflow.bg.settings';
+export const BGEVT_READY = 'deskflow.bg.ready';
+export const BGEVT_STATUS_REQUEST = 'deskflow.bg.status.request';
 
 export default class BackGroundAbility extends UIAbility {
   // 订阅器必须持有引用，否则可能被 GC 回收导致收不到 commonEvent。
@@ -30,16 +33,19 @@ export default class BackGroundAbility extends UIAbility {
   private stopSub: commonEventManager.CommonEventSubscriber | null = null;
   private pushSub: commonEventManager.CommonEventSubscriber | null = null;
   private settingsSub: commonEventManager.CommonEventSubscriber | null = null;
+  private statusRequestSub: commonEventManager.CommonEventSubscriber | null = null;
+  private lastStatus: string = JSON.stringify({ code: 'disconnected', message: '未连接' });
   // 分片剪贴板重组：id -> {parts, total, received, receivedAt}
-  private clipChunks: Map<string, { parts: string[], total: number, received: number, receivedAt: number }> = new Map();
+  private clipChunks: ClipboardAssembler = new ClipboardAssembler();
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, TAG, 'BackGroundAbility onCreate');
+    this.wireEvents();
     const host = want.parameters?.['host'] as string;
 
     if (!host) {
       hilog.info(DOMAIN, TAG, 'no host in want, running as pure carrier');
-      this.wireEvents();
+      this.publish({ event: BGEVT_READY, data: 'ready' });
       return;
     }
     const port = Number(want.parameters?.['port'] ?? 24800);
@@ -59,9 +65,11 @@ export default class BackGroundAbility extends UIAbility {
       hilog.info(DOMAIN, TAG, 'connect %{public}s:%{public}d', host, port);
     } catch (e) {
       hilog.error(DOMAIN, TAG, 'connect/push failed: %{public}s', JSON.stringify(e));
+      const err = e as BusinessError;
+      this.publish({ event: BGEVT_STATUS,
+        data: JSON.stringify({ code: 'error', message: `connect failed (${err.code}): ${err.message}` }) });
     }
-
-    this.wireEvents();
+    this.publish({ event: BGEVT_READY, data: 'ready' });
   }
 
   /**
@@ -95,6 +103,7 @@ export default class BackGroundAbility extends UIAbility {
       deskflow.onDeskflowStatus((event: deskflow.ValueChangeEvent) => {
         const msg = event.value ?? '';
         const payload = JSON.stringify({ code: this.statusCode(msg), message: msg });
+        this.lastStatus = payload;
         const data: commonEventManager.CommonEventData = { event: BGEVT_STATUS, data: payload };
         this.publish(data);
       });
@@ -186,6 +195,15 @@ export default class BackGroundAbility extends UIAbility {
     } catch (e) {
       hilog.error(DOMAIN, TAG, 'settings sub fail: %{public}s', JSON.stringify(e));
     }
+    try {
+      const info: commonEventManager.CommonEventSubscribeInfo = { events: [BGEVT_STATUS_REQUEST] };
+      this.statusRequestSub = commonEventManager.createSubscriberSync(info);
+      commonEventManager.subscribe(this.statusRequestSub, (err) => {
+        if (!err) this.publish({ event: BGEVT_STATUS, data: this.lastStatus });
+      });
+    } catch (e) {
+      hilog.error(DOMAIN, TAG, 'status request sub fail: %{public}s', JSON.stringify(e));
+    }
   }
 
   /**
@@ -193,48 +211,15 @@ export default class BackGroundAbility extends UIAbility {
    * 返回 null；收到非分片文本直接原样返回。超时 30s 未齐的分片丢弃。
    */
   private reassembleClipChunk(raw: string): string | null {
-    let parsed: Record<string, unknown> | null = null;
     try {
-      const obj = JSON.parse(raw) as Record<string, unknown>;
+      const obj = JSON.parse(raw) as ClipboardChunk;
       if (obj.clipChunk === true) {
-        parsed = obj;
+        return this.clipChunks.accept(obj);
       }
     } catch (e) {
-      // 非 JSON：普通单片文本
+      // Compatibility with an older UI process sending plain text.
     }
-    if (parsed === null) {
-      return raw;
-    }
-    const id = `${parsed.id ?? ''}`;
-    const index = Number(parsed.index);
-    const total = Number(parsed.total);
-    const chunk = `${parsed.data ?? ''}`;
-    if (!id || !Number.isInteger(index) || !Number.isInteger(total) || total < 1 || total > 16 || index < 0 || index >= total) {
-      hilog.warn(DOMAIN, TAG, 'bad clip chunk header, dropping');
-      return null;
-    }
-    const now = Date.now();
-    // 清理超时未齐的分片，避免内存残留
-    this.clipChunks.forEach((entry, key) => {
-      if (now - entry.receivedAt > 30000) {
-        this.clipChunks.delete(key);
-      }
-    });
-    let entry = this.clipChunks.get(id);
-    if (!entry) {
-      entry = { parts: new Array<string>(total).fill(''), total: total, received: 0, receivedAt: now };
-      this.clipChunks.set(id, entry);
-    }
-    if (entry.parts[index] === '') {
-      entry.received++;
-    }
-    entry.parts[index] = chunk;
-    entry.receivedAt = now;
-    if (entry.received < total) {
-      return null;
-    }
-    this.clipChunks.delete(id);
-    return entry.parts.join('');
+    return raw;
   }
 
   private publish(msg: commonEventManager.CommonEventData): void {
@@ -271,6 +256,11 @@ export default class BackGroundAbility extends UIAbility {
         commonEventManager.unsubscribe(this.settingsSub);
         this.settingsSub = null;
       }
+      if (this.statusRequestSub) {
+        commonEventManager.unsubscribe(this.statusRequestSub);
+        this.statusRequestSub = null;
+      }
+      this.clipChunks.clear();
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'unsubscribe fail: %{public}s', JSON.stringify(e));
     }

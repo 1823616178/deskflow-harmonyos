@@ -165,7 +165,7 @@ ProtoUtil::writef(out, "%7s%2i%2i%s",
 Deskflow / Barrier 的服务端在收到客户端消息后会依赖"客户端响应"来维持交互节奏。为避免服务端阻塞等待（其底层有"BSD 延迟 ACK"相关的处理逻辑），本工程的客户端在**握手完成（收到 `DSOP`）之后**，对每一条处理完成的消息都回一条 `CNOP` 帧：
 
 ```
-if (m_handshakeDone) {
+if (m_handshakeDone && key != "CALV") {
     writeFrame("CNOP", 4);   // 4 字节 key，无额外参数
 }
 ```
@@ -184,7 +184,7 @@ if (m_handshakeDone) {
 if (key == "CALV") writeFrame("CALV", 4);
 ```
 
-实现要求：空闲期 `recv` 不能长时间阻塞导致错过心跳。本工程连接置为 blocking 同时依赖服务端 3s 心跳维持 `recv` 活跃；若需自行实现保活，应把心跳超时纳入连接看门狗。
+实现要求：服务端通常每 3s 发送心跳；客户端对每次完整读取设置 10s 截止时间，超时后断开重连，并启用 TCP keepalive。停止连接时先 `shutdown` 唤醒 I/O，由工作线程关闭套接字并清理解析缓冲区。
 
 ---
 
