@@ -15,6 +15,7 @@ add_library(entry SHARED napi_init.cpp
             protocol/proto_util.cpp
             protocol/socket_stream.cpp
             protocol/deskflow_client.cpp)
+set_target_properties(entry PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES)
 target_link_libraries(entry PUBLIC libace_napi.z.so libohinput.so libhilog_ndk.z.so)
 
 # Warn loudly, but do not fail the build on warnings yet: the pre-existing

@@ -304,6 +304,10 @@ void DeskflowClient::resetSessionState(bool releaseInputs)
     m_clipChunk.expectedSize = 0;
     m_clipChunk.clipSeq = 0;
     m_clipChunk.startTimeMs = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_clipboardMutex);
+        m_lastClipboardText.clear();
+    }
     m_lastFrameTimeMs = nowMs();
 }
 
@@ -312,6 +316,7 @@ bool DeskflowClient::start(const std::string& host, uint16_t port, const std::st
     if (m_running.load()) {
         return false;
     }
+    waitForExit();
     m_host = host;
     m_port = port;
     m_screenName = screenName;
@@ -327,7 +332,7 @@ bool DeskflowClient::start(const std::string& host, uint16_t port, const std::st
 void DeskflowClient::stop()
 {
     m_stopRequested = true;
-    m_stream.close(); // unblock recv
+    m_stream.interrupt(); // wake I/O; only the worker clears parser state
 }
 
 void DeskflowClient::setStatus(const std::string& s)
@@ -402,10 +407,6 @@ bool DeskflowClient::sendClipboard(const std::string& text)
     constexpr uint8_t kDataEnd = 3;
     uint8_t id = 0;            // kClipboardClipboard（主剪贴板）
     uint32_t seq = m_seqNum;   // 用活跃 CINN 的会话序号，勿手动递增
-    {
-        std::lock_guard<std::mutex> lock(m_clipboardMutex);
-        m_lastClipboardText = text;
-    }
     const size_t kChunk = 512 * 1024;  // 与服务端 StreamChunker 一致（512KB）
     bool ok = true;
     // 1) Start：payload = 期望总大小（ASCI十进制）
@@ -431,6 +432,10 @@ bool DeskflowClient::sendClipboard(const std::string& text)
     }
     DF_LOGI("DCLP push id=%{public}u seq=%{public}u text=%{public}zu container=%{public}zu ok=%{public}d",
         id, seq, text.size(), payload.size(), ok ? 1 : 0);
+    if (ok) {
+        std::lock_guard<std::mutex> lock(m_clipboardMutex);
+        m_lastClipboardText = text;
+    }
     return ok;
 }
 
@@ -463,8 +468,9 @@ void DeskflowClient::pushClipboard(const std::string& text)
             return;  // already synced (incl. remote echo) - avoid a loop
         }
     }
-    grabClipboard();
-    sendClipboard(text);
+    if (grabClipboard()) {
+        sendClipboard(text);
+    }
 }
 
 // 保留（不再被 CINN 调用）：进入屏幕时由服务端主动下推 DCLP，客户端无需 CCLP 抓取。
@@ -507,8 +513,11 @@ void DeskflowClient::run()
         }
         setStatus("reconnecting in " + std::to_string(waitMs) + "ms");
         DF_LOGI("reconnect in %{public}d ms (failures=%{public}d)", waitMs, failures);
-        for (int32_t waited = 0; waited < waitMs && !m_stopRequested.load(); waited += 100) {
+        for (int32_t waited = 0; waited < waitMs && !m_stopRequested.load() && m_autoReconnect.load(); waited += 100) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!m_autoReconnect.load()) {
+            break;
         }
     }
 
@@ -529,6 +538,10 @@ bool DeskflowClient::runOnce()
         DF_LOGE("connect failed");
         setStatus("error: connect failed");
         return true;  // 可重连（例如服务端暂不可达）
+    }
+    if (m_stopRequested.load()) {
+        m_stream.close();
+        return false;
     }
     DF_LOGI("tcp connected");
     setStatus("connected, handshake...");

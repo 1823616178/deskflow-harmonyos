@@ -65,7 +65,7 @@ public:
     void setInvertScroll(bool invert) { m_invertScroll = invert; }
 
     // Request stop and disconnect (non-blocking; worker thread exits
-    // promptly because close() shutdown()s the socket out of recv()).
+    // promptly because interrupt() wakes the socket out of recv()).
     void stop();
 
     // Block until the worker thread has exited (no-op if not running).
@@ -146,8 +146,8 @@ private:
     std::atomic<int32_t> m_pointerX{0};
     std::atomic<int32_t> m_pointerY{0};
     bool m_active = false;
-    bool m_handshakeDone = false;   // 收到 DSOP 后进入运行期（此后每条消息回 CNOP）
-    uint32_t m_seqNum = 0;          // 最近 CINN 的会话序号（剪贴板用）
+    std::atomic<bool> m_handshakeDone{false}; // also read by clipboard sender
+    std::atomic<uint32_t> m_seqNum{0};       // 最近 CINN 的会话序号（剪贴板用）
     // 剪贴板同步开关（ArkTS 开关控制）
     std::atomic<bool> m_clipboardSync{false};
     // 远程剪贴板文本回调（worker → JS，经 NAPI tsfn 投递）——用下面的 mutex 保护

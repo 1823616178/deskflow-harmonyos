@@ -8,11 +8,14 @@
 
 #include <cerrno>
 #include <cstring>
+#include <chrono>
+#include <utility>
 
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -26,7 +29,38 @@ namespace dfpoc {
 constexpr int kRecvTimeoutSec = 10;
 constexpr int kSendTimeoutSec = 5;
 
-SocketStream::SocketStream() : m_fd(-1), m_readTimedOut(false), m_bufferPos(0), m_frameEnd(0) {}
+namespace {
+using Clock = std::chrono::steady_clock;
+
+int waitForSocket(int fd, short events, Clock::time_point deadline)
+{
+    for (;;) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+        if (remaining <= 0) {
+            return 0;
+        }
+        pollfd descriptor{fd, events, 0};
+        const int rc = ::poll(&descriptor, 1, static_cast<int>(remaining));
+        if (rc < 0 && errno == EINTR) {
+            continue;
+        }
+        return rc;
+    }
+}
+}
+
+SocketStream::SocketStream() : m_fd(-1), m_readTimedOut(false), m_bufferPos(0) {}
+
+SocketStream::SocketStream(SocketStream&& other) noexcept : SocketStream()
+{
+    std::unique_lock<std::shared_mutex> lock(other.m_socketMutex);
+    m_fd = std::exchange(other.m_fd, -1);
+    m_readTimedOut = other.m_readTimedOut;
+    m_writeFailed = other.m_writeFailed.load();
+    m_buffer = std::move(other.m_buffer);
+    m_bufferPos = std::exchange(other.m_bufferPos, 0);
+    m_frameActive = std::exchange(other.m_frameActive, false);
+}
 
 SocketStream::~SocketStream()
 {
@@ -47,7 +81,8 @@ bool SocketStream::connect(const std::string& host, uint16_t port, int timeoutMs
         return false;
     }
 
-    for (struct addrinfo* ai = result; ai != nullptr; ai = ai->ai_next) {
+    const auto deadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
+    for (struct addrinfo* ai = result; ai != nullptr && Clock::now() < deadline; ai = ai->ai_next) {
         int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) {
             continue;
@@ -65,17 +100,8 @@ bool SocketStream::connect(const std::string& host, uint16_t port, int timeoutMs
 
         rc = ::connect(fd, ai->ai_addr, ai->ai_addrlen);
         if (rc != 0 && errno == EINPROGRESS) {
-            // select() may be interrupted by a signal; retry it.
-            int sel = -1;
-            do {
-                fd_set wfds;
-                FD_ZERO(&wfds);
-                FD_SET(fd, &wfds);
-                struct timeval tv;
-                tv.tv_sec = timeoutMs / 1000;
-                tv.tv_usec = (timeoutMs % 1000) * 1000;
-                sel = select(fd + 1, nullptr, &wfds, nullptr, &tv);
-            } while (sel < 0 && errno == EINTR);
+            // An interrupted wait keeps the original deadline.
+            const int sel = waitForSocket(fd, POLLOUT, deadline);
             if (sel > 0) {
                 int err = 0;
                 socklen_t len = sizeof(err);
@@ -95,30 +121,36 @@ bool SocketStream::connect(const std::string& host, uint16_t port, int timeoutMs
             // Low latency for mouse/keyboard traffic: do not let Nagle
             // delay the small CNOP / input frames.
             int one = 1;
-            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+            bool configured = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) == 0;
             // Dead-peer detection at the TCP layer.
-            setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+            configured = (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one)) == 0) && configured;
 #ifdef TCP_KEEPIDLE
             int idle = 5;
-            setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+            configured = (setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle)) == 0) && configured;
 #endif
 #ifdef TCP_KEEPINTVL
             int intvl = 3;
-            setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+            configured = (setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl)) == 0) && configured;
 #endif
 #ifdef TCP_KEEPCNT
             int cnt = 3;
-            setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+            configured = (setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt)) == 0) && configured;
 #endif
             struct timeval rtv;
             rtv.tv_sec = kRecvTimeoutSec;
             rtv.tv_usec = 0;
-            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+            configured = (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv)) == 0) && configured;
             struct timeval stv;
             stv.tv_sec = kSendTimeoutSec;
             stv.tv_usec = 0;
-            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof(stv));
+            configured = (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof(stv)) == 0) && configured;
+            if (!configured) {
+                ::close(fd);
+                continue;
+            }
+            std::unique_lock<std::shared_mutex> lock(m_socketMutex);
             m_fd = fd;
+            m_writeFailed = false;
             m_readTimedOut = false;
             freeaddrinfo(result);
             return true;
@@ -137,23 +169,17 @@ void SocketStream::compactBuffer()
     if (m_bufferPos >= m_buffer.size()) {
         m_buffer.clear();
         m_bufferPos = 0;
-        m_frameEnd = 0;
         return;
     }
     // Still bytes left (only possible when a frame was abandoned):
     // drop the consumed prefix instead of letting the vector grow.
     m_buffer.erase(m_buffer.begin(), m_buffer.begin() + static_cast<long>(m_bufferPos));
-    if (m_frameEnd >= m_bufferPos) {
-        m_frameEnd -= m_bufferPos;
-    } else {
-        m_frameEnd = 0;
-    }
     m_bufferPos = 0;
 }
 
 size_t SocketStream::bufferRemaining() const
 {
-    size_t end = (m_frameEnd != 0) ? m_frameEnd : m_buffer.size();
+    size_t end = m_buffer.size();
     if (end <= m_bufferPos) {
         return 0;
     }
@@ -162,22 +188,28 @@ size_t SocketStream::bufferRemaining() const
 
 bool SocketStream::readExactSocket(uint8_t* data, size_t n)
 {
+    std::shared_lock<std::shared_mutex> lock(m_socketMutex);
+    if (m_fd < 0) {
+        return false;
+    }
+    m_readTimedOut = false;
+    const auto deadline = Clock::now() + std::chrono::seconds(kRecvTimeoutSec);
     size_t got = 0;
     while (got < n) {
-        ssize_t rc = ::recv(m_fd, data + got, n - got, 0);
+        const int ready = waitForSocket(m_fd, POLLIN, deadline);
+        if (ready <= 0) {
+            m_readTimedOut = ready == 0;
+            return false;
+        }
+        ssize_t rc = ::recv(m_fd, data + got, n - got, MSG_DONTWAIT);
         if (rc > 0) {
             got += static_cast<size_t>(rc);
             m_readTimedOut = false;
         } else if (rc == 0) {
             return false; // EOF
         } else {
-            if (errno == EINTR) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
                 continue;
-            }
-            // EAGAIN/EWOULDBLOCK here means SO_RCVTIMEO fired:
-            // the peer is silent (no CALV for 10s) -> treat as dead.
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                m_readTimedOut = true;
             }
             return false;
         }
@@ -187,42 +219,34 @@ bool SocketStream::readExactSocket(uint8_t* data, size_t n)
 
 bool SocketStream::readExact(uint8_t* data, size_t n)
 {
-    size_t got = 0;
-    // Consume buffered data first, never past the current frame end.
-    size_t end = (m_frameEnd != 0) ? m_frameEnd : m_buffer.size();
-    while (got < n && m_bufferPos < end) {
-        data[got++] = m_buffer[m_bufferPos++];
-    }
-    if (got == n) {
+    if (m_frameActive) {
+        if (n > bufferRemaining()) {
+            return false;
+        }
+        if (n > 0) {
+            std::memcpy(data, m_buffer.data() + m_bufferPos, n);
+            m_bufferPos += n;
+        }
         if (m_bufferPos >= m_buffer.size()) {
             compactBuffer();
         }
         return true;
     }
-    // Frame active but exhausted: asking for more would consume the
-    // next frame's bytes. Fail instead of desyncing the stream.
-    if (m_frameEnd != 0) {
-        return false;
-    }
-    // No frame active (length-prefix reads in readFrame): read the
-    // remainder straight from the socket.
-    if (!readExactSocket(data + got, n - got)) {
-        return false;
-    }
-    if (m_bufferPos >= m_buffer.size()) {
-        compactBuffer();
-    }
-    return true;
+    return readExactSocket(data, n);
 }
 
-bool SocketStream::writeAll(const uint8_t* data, size_t n)
+bool SocketStream::writeAllSocket(int fd, const uint8_t* data, size_t n)
 {
+    const auto deadline = Clock::now() + std::chrono::seconds(kSendTimeoutSec);
     size_t sent = 0;
     while (sent < n) {
-        ssize_t rc = ::send(m_fd, data + sent, n - sent, MSG_NOSIGNAL);
+        if (waitForSocket(fd, POLLOUT, deadline) <= 0) {
+            return false;
+        }
+        ssize_t rc = ::send(fd, data + sent, n - sent, MSG_NOSIGNAL | MSG_DONTWAIT);
         if (rc > 0) {
             sent += static_cast<size_t>(rc);
-        } else if (rc < 0 && errno == EINTR) {
+        } else if (rc < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
             continue;
         } else {
             // Includes EAGAIN from SO_SNDTIMEO: peer not reading.
@@ -232,14 +256,28 @@ bool SocketStream::writeAll(const uint8_t* data, size_t n)
     return true;
 }
 
+bool SocketStream::writeAll(const uint8_t* data, size_t n)
+{
+    std::lock_guard<std::mutex> writeLock(m_writeMutex);
+    std::shared_lock<std::shared_mutex> socketLock(m_socketMutex);
+    if (m_fd < 0 || m_writeFailed.load()) {
+        return false;
+    }
+    if (writeAllSocket(m_fd, data, n)) {
+        return true;
+    }
+    m_writeFailed = true;
+    ::shutdown(m_fd, SHUT_RDWR);
+    return false;
+}
+
 bool SocketStream::readFrame(std::vector<uint8_t>& out)
 {
     // Any leftover bytes from a previous (abandoned) frame must not leak
     // into the next frame's length prefix.
-    if (m_bufferPos < m_buffer.size()) {
-        compactBuffer();
-    }
-    m_frameEnd = 0;
+    m_buffer.clear();
+    m_bufferPos = 0;
+    m_frameActive = false;
     uint8_t lenb[4] = {0, 0, 0, 0};
     if (!readExactSocket(lenb, 4)) {
         return false;
@@ -260,7 +298,7 @@ bool SocketStream::readFrame(std::vector<uint8_t>& out)
 
 bool SocketStream::writeFrame(const uint8_t* data, size_t n)
 {
-    if (n > 4 * 1024 * 1024) {
+    if (n > 4 * 1024 * 1024 || (n > 0 && data == nullptr)) {
         return false;
     }
     uint8_t lenb[4] = {
@@ -269,10 +307,20 @@ bool SocketStream::writeFrame(const uint8_t* data, size_t n)
         static_cast<uint8_t>((n >> 8) & 0xFF),
         static_cast<uint8_t>(n & 0xFF)
     };
-    if (!writeAll(lenb, 4)) {
+    // Keep length and payload together, including when the clipboard
+    // and heartbeat threads write at the same time.
+    std::lock_guard<std::mutex> writeLock(m_writeMutex);
+    std::shared_lock<std::shared_mutex> socketLock(m_socketMutex);
+    if (m_fd < 0 || m_writeFailed.load()) {
         return false;
     }
-    return data == nullptr || n == 0 || writeAll(data, n);
+    if (writeAllSocket(m_fd, lenb, 4) && (n == 0 || writeAllSocket(m_fd, data, n))) {
+        return true;
+    }
+    // Never append another frame to an incomplete write.
+    m_writeFailed = true;
+    ::shutdown(m_fd, SHUT_RDWR);
+    return false;
 }
 
 void SocketStream::pushToBuffer(const uint8_t* data, size_t n)
@@ -280,22 +328,38 @@ void SocketStream::pushToBuffer(const uint8_t* data, size_t n)
     // A new frame replaces any stale buffered bytes.
     m_buffer.clear();
     m_bufferPos = 0;
-    m_buffer.insert(m_buffer.end(), data, data + n);
-    m_frameEnd = m_buffer.size();
+    if (n > 0) {
+        m_buffer.insert(m_buffer.end(), data, data + n);
+    }
+    m_frameActive = true;
+}
+
+void SocketStream::interrupt()
+{
+    std::shared_lock<std::shared_mutex> lock(m_socketMutex);
+    m_writeFailed = true;
+    if (m_fd >= 0) {
+        ::shutdown(m_fd, SHUT_RDWR);
+    }
+}
+
+bool SocketStream::isConnected() const
+{
+    std::shared_lock<std::shared_mutex> lock(m_socketMutex);
+    return m_fd >= 0 && !m_writeFailed.load();
 }
 
 void SocketStream::close()
 {
+    interrupt();
+    std::unique_lock<std::shared_mutex> lock(m_socketMutex);
     if (m_fd >= 0) {
-        // shutdown() wakes a thread blocked in recv() on this socket;
-        // close() alone does not reliably do that on POSIX.
-        ::shutdown(m_fd, SHUT_RDWR);
         ::close(m_fd);
         m_fd = -1;
     }
     m_buffer.clear();
     m_bufferPos = 0;
-    m_frameEnd = 0;
+    m_frameActive = false;
 }
 
 } // namespace dfpoc

@@ -22,6 +22,8 @@
 #include <chrono>
 #include <thread>
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include "napi/native_api.h"
 #include "hilog/log.h"
 #include "multimodalinput/oh_input_manager.h"
@@ -45,6 +47,9 @@ static std::mutex g_tsfnMutex;
 // connectDeskflow() calls cannot spawn two starters racing on the
 // same global client.
 static std::atomic<bool> g_connectInProgress{false};
+static std::thread g_connectStarter;
+static std::mutex g_clientStartMutex;
+static std::atomic<uint64_t> g_connectGeneration{0};
 // Trail generation: starting a new trail cancels any older one still
 // injecting, instead of letting two threads fight over the pointer.
 static std::atomic<int32_t> g_trailGeneration{0};
@@ -80,7 +85,14 @@ static bool GetStringArg(napi_env env, napi_value arg, std::string& out, size_t 
 
 static bool GetIntArg(napi_env env, napi_value arg, int32_t& out)
 {
-    return napi_get_value_int32(env, arg, &out) == napi_ok;
+    double value = 0;
+    if (napi_get_value_double(env, arg, &value) != napi_ok || !std::isfinite(value) ||
+        std::trunc(value) != value || value < std::numeric_limits<int32_t>::min() ||
+        value > std::numeric_limits<int32_t>::max()) {
+        return false;
+    }
+    out = static_cast<int32_t>(value);
+    return true;
 }
 
 static bool GetBoolArg(napi_env env, napi_value arg, bool& out)
@@ -127,6 +139,10 @@ static void CallTsfn(napi_threadsafe_function tsfn, std::string* value)
 void DeskflowStatusCallJs(napi_env env, napi_value js_cb, void* context, void* data)
 {
     std::string* value = static_cast<std::string*>(data);
+    if (env == nullptr || js_cb == nullptr || value == nullptr) {
+        delete value;
+        return;
+    }
     napi_value event;
     napi_create_object(env, &event);
     napi_value value_js;
@@ -146,16 +162,12 @@ void DeskflowStatusCallJs(napi_env env, napi_value js_cb, void* context, void* d
 // 并发安全：对 g_statusTsfn 的读写加锁，避免 worker 线程与 JS 线程竞态。
 void DeskflowStatusCb(const std::string& status)
 {
-    napi_threadsafe_function tsfn = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_tsfnMutex);
-        tsfn = g_statusTsfn;
-    }
-    if (tsfn == nullptr) {
+    std::lock_guard<std::mutex> lock(g_tsfnMutex);
+    if (g_statusTsfn == nullptr) {
         DF_LOGW("DeskflowStatusCb: status callback not registered yet, drop '%{public}s'", status.c_str());
         return;
     }
-    CallTsfn(tsfn, new std::string(status));
+    CallTsfn(g_statusTsfn, new std::string(status));
 }
 
 static napi_value OnDeskflowStatus(napi_env env, napi_callback_info info)
@@ -181,6 +193,10 @@ static napi_value OnDeskflowStatus(napi_env env, napi_callback_info info)
 void ClipboardDataCallJs(napi_env env, napi_value js_cb, void* context, void* data)
 {
     std::string* value = static_cast<std::string*>(data);
+    if (env == nullptr || js_cb == nullptr || value == nullptr) {
+        delete value;
+        return;
+    }
     napi_value event;
     napi_create_object(env, &event);
     napi_value value_js;
@@ -214,15 +230,8 @@ static napi_value OnClipboardData(napi_env env, napi_callback_info info)
 // 服务端剪贴板文本到达（worker 线程）——转发到 JS
 static void PublishClipboard(const std::string& text)
 {
-    napi_threadsafe_function tsfn = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_tsfnMutex);
-        tsfn = g_clipboardTsfn;
-    }
-    if (tsfn == nullptr) {
-        return;
-    }
-    CallTsfn(tsfn, new std::string(text));
+    std::lock_guard<std::mutex> lock(g_tsfnMutex);
+    CallTsfn(g_clipboardTsfn, new std::string(text));
 }
 
 // setClipboardCallback + pushClipboard 在建立连接时由 NAPI 绑定：
@@ -301,10 +310,23 @@ static napi_value ConnectDeskflow(napi_env env, napi_callback_info info)
     }
     DF_LOGI("connectDeskflow: target %{public}s:%{public}d screen %{public}dx%{public}d",
         host.c_str(), port, screenW, screenH);
-    g_deskflowClient.stop();
+    uint64_t generation;
+    {
+        std::lock_guard<std::mutex> lock(g_clientStartMutex);
+        generation = ++g_connectGeneration;
+        g_deskflowClient.stop();
+    }
+    if (g_connectStarter.joinable()) {
+        g_connectStarter.join();
+    }
     // 后台线程等旧 worker 退出（join）后再启动新连接；JS 线程立即返回。
-    std::thread([host, port, name, screenW, screenH] {
+    g_connectStarter = std::thread([host, port, name, screenW, screenH, generation] {
         g_deskflowClient.waitForExit();
+        std::lock_guard<std::mutex> lock(g_clientStartMutex);
+        if (generation != g_connectGeneration.load()) {
+            g_connectInProgress = false;
+            return;
+        }
         if (g_deskflowClient.isRunning()) {
             DF_LOGE("previous client is still stopping, connect aborted");
             DeskflowStatusCb("error: previous client is still stopping, please retry in a moment");
@@ -321,13 +343,15 @@ static napi_value ConnectDeskflow(napi_env env, napi_callback_info info)
             DeskflowStatusCb("error: client already running");
         }
         g_connectInProgress = false;
-    }).detach();
+    });
     return MakeString(env, "client starting: " + host + ":" + std::to_string(port));
 }
 
 // disconnectDeskflow(): 断开连接
 static napi_value DisconnectDeskflow(napi_env env, napi_callback_info info)
 {
+    std::lock_guard<std::mutex> lock(g_clientStartMutex);
+    ++g_connectGeneration;
     g_deskflowClient.stop();
     std::string message = "disconnect requested";
     napi_value result;
@@ -369,6 +393,10 @@ napi_threadsafe_function g_tsfn = nullptr;
 void CallJsOnThread(napi_env env, napi_value js_cb, void* context, void* data)
 {
     std::string* value = static_cast<std::string*>(data);
+    if (env == nullptr || js_cb == nullptr || value == nullptr) {
+        delete value;
+        return;
+    }
     napi_value event;
     napi_create_object(env, &event);
     napi_value value_js;
@@ -385,18 +413,10 @@ void CallJsOnThread(napi_env env, napi_value js_cb, void* context, void* data)
 // 加锁从 g_tsfn 快照指针并投递，避免与 JS 线程 / 其它回调线程竞态（use-after-free）。
 void PublishValue(const std::string& text)
 {
-    napi_threadsafe_function tsfn = nullptr;
     std::string* value = new std::string(text);  // 先构造，避免在锁内分配
-    {
-        std::lock_guard<std::mutex> lock(g_tsfnMutex);
-        tsfn = g_tsfn;
-    }
-    if (tsfn == nullptr) {
-        delete value;
-        return;
-    }
+    std::lock_guard<std::mutex> lock(g_tsfnMutex);
     // nonblocking：避免在 JS 线程繁忙时阻塞调用线程
-    CallTsfn(tsfn, value);
+    CallTsfn(g_tsfn, value);
 }
 
 
@@ -894,9 +914,31 @@ static napi_value InjectKey(napi_env env, napi_callback_info info)
     return MakeString(env, message);
 }
 
+static void CleanupDeskflow(void*)
+{
+    ++g_trailGeneration;
+    {
+        std::lock_guard<std::mutex> lock(g_clientStartMutex);
+        ++g_connectGeneration;
+        g_deskflowClient.stop();
+    }
+    if (g_connectStarter.joinable()) {
+        g_connectStarter.join();
+    }
+    g_deskflowClient.waitForExit();
+    std::lock_guard<std::mutex> lock(g_tsfnMutex);
+    for (auto* tsfn : {&g_statusTsfn, &g_clipboardTsfn, &g_tsfn}) {
+        if (*tsfn != nullptr) {
+            napi_release_threadsafe_function(*tsfn, napi_tsfn_abort);
+            *tsfn = nullptr;
+        }
+    }
+}
+
 EXTERN_C_START
 static napi_value Init(napi_env env, napi_value exports)
 {
+    napi_add_env_cleanup_hook(env, CleanupDeskflow, nullptr);
     napi_property_descriptor desc[] = {
         { "onChange", nullptr, OnChange, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "addKeyEventInterceptor", nullptr, AddKeyEventInterceptor, nullptr, nullptr, nullptr, napi_default, nullptr },

@@ -7,6 +7,9 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -17,6 +20,9 @@ class SocketStream
 public:
     SocketStream();
     ~SocketStream();
+    SocketStream(const SocketStream&) = delete;
+    SocketStream& operator=(const SocketStream&) = delete;
+    SocketStream(SocketStream&& other) noexcept;
 
     // Connect to host:port. Returns true on success.
     // On success the socket gets TCP_NODELAY, TCP keepalive and
@@ -52,8 +58,11 @@ public:
     size_t bufferRemaining() const;
 
     void close();
+    // Safe from another thread: wake I/O without changing parser state
+    // or releasing a descriptor still in use. The worker closes later.
+    void interrupt();
 
-    bool isConnected() const { return m_fd >= 0; }
+    bool isConnected() const;
 
     // True if the most recent socket read failed because SO_RCVTIMEO
     // fired (peer silent). Cleared on the next successful read/connect.
@@ -63,16 +72,20 @@ private:
     // Socket-only exact read, used by readFrame for the length prefix.
     // Never touches m_buffer.
     bool readExactSocket(uint8_t* data, size_t n);
+    bool writeAllSocket(int fd, const uint8_t* data, size_t n);
     // Drop already-consumed bytes so m_buffer does not grow forever.
     void compactBuffer();
 
     int m_fd;
+    mutable std::shared_mutex m_socketMutex;
+    std::mutex m_writeMutex;
+    std::atomic<bool> m_writeFailed{false};
     bool m_readTimedOut{false};
     std::vector<uint8_t> m_buffer;
     size_t m_bufferPos;
-    // End of the current frame inside m_buffer (== m_buffer.size()
-    // while a frame is active). 0 means "no frame active".
-    size_t m_frameEnd;
+    // Empty and fully consumed frames remain active until readFrame()
+    // or pushToBuffer() explicitly starts the next frame.
+    bool m_frameActive{false};
 };
 
 } // namespace dfpoc

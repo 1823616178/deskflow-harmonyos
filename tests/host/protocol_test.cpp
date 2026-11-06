@@ -15,6 +15,12 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "proto_util.h"
 #include "socket_stream.h"
@@ -151,6 +157,125 @@ static void testFrameTooLarge()
     CHECK(!s.writeFrame(big.data(), big.size()));
 }
 
+// Real TCP peers are needed here: an invalid descriptor would hide
+// parser fall-through by failing the unintended recv() immediately.
+static int connectLoopback(SocketStream& stream)
+{
+    const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(listener >= 0);
+    if (listener < 0) return -1;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    const bool listening = ::bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0 &&
+        ::listen(listener, 1) == 0;
+    CHECK(listening);
+    if (!listening) { ::close(listener); return -1; }
+    socklen_t size = sizeof(address);
+    CHECK(::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &size) == 0);
+    const bool connected = stream.connect("127.0.0.1", ntohs(address.sin_port));
+    CHECK(connected);
+    if (!connected) { ::close(listener); return -1; }
+    const int peer = ::accept(listener, nullptr, nullptr);
+    ::close(listener);
+    CHECK(peer >= 0);
+    if (peer >= 0) {
+        timeval timeout{2, 0};
+        ::setsockopt(peer, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    }
+    return peer;
+}
+
+static void testEmptyAndConsumedFrameBoundaries()
+{
+    for (bool empty : {true, false}) {
+        SocketStream stream;
+        const int peer = connectLoopback(stream);
+        if (peer < 0) return;
+        const uint8_t incoming[] = {0, 0, 0, 4, 'N', 'E', 'X', 'T'};
+        CHECK(::send(peer, incoming, sizeof(incoming), MSG_NOSIGNAL) == sizeof(incoming));
+        const uint8_t current[] = {'C', 'N', 'O', 'P'};
+        stream.pushToBuffer(empty ? nullptr : current, empty ? 0 : sizeof(current));
+        uint8_t bytes[4]{};
+        if (!empty) CHECK(stream.readExact(bytes, sizeof(bytes)));
+        CHECK(!stream.readExact(bytes, 1));
+        std::vector<uint8_t> next;
+        CHECK(stream.readFrame(next));
+        CHECK(next == std::vector<uint8_t>({'N', 'E', 'X', 'T'}));
+        ::close(peer);
+    }
+}
+
+static void testInterruptWakesReader()
+{
+    SocketStream stream;
+    const int peer = connectLoopback(stream);
+    if (peer < 0) return;
+    bool readResult = true;
+    std::thread reader([&] {
+        std::vector<uint8_t> frame;
+        readResult = stream.readFrame(frame);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const auto before = std::chrono::steady_clock::now();
+    stream.interrupt();
+    reader.join();
+    CHECK(!readResult);
+    CHECK(std::chrono::steady_clock::now() - before < std::chrono::seconds(2));
+    CHECK(!stream.isConnected());
+    ::close(peer);
+
+    const uint8_t buffered[] = {'C', 'N', 'O', 'P'};
+    stream.pushToBuffer(buffered, sizeof(buffered));
+    stream.interrupt();
+    uint8_t bytes[4]{};
+    CHECK(stream.readExact(bytes, sizeof(bytes)));
+    CHECK(std::memcmp(bytes, buffered, sizeof(bytes)) == 0);
+}
+
+static bool recvPeerExact(int peer, uint8_t* bytes, size_t size)
+{
+    size_t received = 0;
+    while (received < size) {
+        const auto count = ::recv(peer, bytes + received, size - received, 0);
+        if (count <= 0) return false;
+        received += static_cast<size_t>(count);
+    }
+    return true;
+}
+
+static void testConcurrentWritersKeepFramesIntact()
+{
+    SocketStream stream;
+    const int peer = connectLoopback(stream);
+    if (peer < 0) return;
+    std::atomic<bool> ok{true};
+    auto writeFrames = [&](uint8_t value) {
+        const uint8_t data[] = {value, value, value, value};
+        for (int i = 0; i < 100; ++i) {
+            if (!stream.writeFrame(data, sizeof(data))) ok = false;
+        }
+    };
+    std::thread first(writeFrames, 'A');
+    std::thread second(writeFrames, 'B');
+    first.join();
+    second.join();
+    CHECK(ok.load());
+    int a = 0, b = 0;
+    for (int i = 0; i < 200; ++i) {
+        uint8_t frame[8]{};
+        const bool received = recvPeerExact(peer, frame, sizeof(frame));
+        CHECK(received);
+        if (!received) break;
+        CHECK(frame[0] == 0 && frame[1] == 0 && frame[2] == 0 && frame[3] == 4);
+        CHECK(frame[4] == frame[5] && frame[5] == frame[6] && frame[6] == frame[7]);
+        if (frame[4] == 'A') ++a;
+        if (frame[4] == 'B') ++b;
+    }
+    CHECK(a == 100 && b == 100);
+    ::close(peer);
+}
+
 int main()
 {
     testWriteReadHello();
@@ -160,6 +285,9 @@ int main()
     testFrameBoundary();
     testBufferDoesNotGrowForever();
     testFrameTooLarge();
+    testEmptyAndConsumedFrameBoundaries();
+    testInterruptWakesReader();
+    testConcurrentWritersKeepFramesIntact();
     std::printf("protocol_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }
