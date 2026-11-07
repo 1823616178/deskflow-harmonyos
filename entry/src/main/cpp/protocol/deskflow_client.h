@@ -119,6 +119,7 @@ private:
     bool injectMouseWheel(int32_t xDelta, int32_t yDelta);
     bool injectMouseWheelAxis(int32_t x, int32_t y, int32_t axisType, float axisValue);
     bool injectKeyEvent(uint32_t keysym, bool down);
+    bool setKeyState(uint32_t keysym, bool down, bool repeat = false);
 
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_stopRequested{false};
@@ -179,7 +180,7 @@ private:
     // MOVE 注入必须携带当前按下的按钮（真实事件流如此，devecocli 抓包确认）
     std::map<int32_t, bool> m_mouseButtonsDown;
     // 同步修饰键状态到 mask（注入缺失的按下/多余的抬起）
-    void syncModifiers(uint32_t mask);
+    bool syncModifiers(uint32_t mask);
     uint32_t maskModifierKeysym(uint32_t maskBit) const;
 };
 

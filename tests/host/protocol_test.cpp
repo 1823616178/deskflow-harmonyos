@@ -1,13 +1,12 @@
 // Host-side unit tests for the protocol layer (ProtoUtil / SocketStream).
-// Runs on a normal Linux/macOS host with g++ -- no HarmonyOS SDK needed:
+// Runs on a Linux host with g++ -- no HarmonyOS SDK needed:
 //   g++ -std=c++17 -I tests/host/stubs -I entry/src/main/cpp/protocol
 //       tests/host/protocol_test.cpp
 //       entry/src/main/cpp/protocol/proto_util.cpp
 //       entry/src/main/cpp/protocol/socket_stream.cpp
 //       -o /tmp/protocol_test && /tmp/protocol_test
-// DeskflowClient itself is not covered here: it needs the real
-// OH_Input injection runtime. Its pure helpers (keysym map, clipboard
-// marshalling) are covered indirectly by the ohosTest suite on device.
+// Input state regressions use controllable stubs in client_input_test.cpp;
+// real device injection still requires the HarmonyOS runtime.
 // SPDX-License-Identifier: GPL-2.0-only WITH LicenseRef-OpenSSL-Exception
 
 #include <cassert>
@@ -102,8 +101,9 @@ static void testStringLengthLimit()
 {
     // A %s length prefix above 1MB must fail, not allocate blindly.
     std::vector<uint8_t> out;
-    // Manually craft: length = 2MB, no body.
+    // Include the full body: failure must be due to the limit, not EOF.
     out = {0x00, 0x20, 0x00, 0x00};
+    out.resize(4 + 2 * 1024 * 1024, 'x');
     SocketStream s = streamWithFrame(out);
     std::string got;
     CHECK(!ProtoUtil::readf(s, "%s", &got));

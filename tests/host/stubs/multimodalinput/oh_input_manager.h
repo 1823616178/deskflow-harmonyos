@@ -3,6 +3,7 @@
 // Do not use in production code.
 #pragma once
 #include <cstdint>
+#include <vector>
 #define INPUT_SUCCESS 0
 #define INPUT_INJECTION_AUTHORIZED 2
 typedef int Input_Result;
@@ -109,30 +110,42 @@ typedef int Input_KeyCode;
 #define MOUSE_AXIS_SCROLL_HORIZONTAL 1
 #define KEY_ACTION_DOWN 0
 #define KEY_ACTION_UP 1
-struct Input_MouseEvent {};
-struct Input_KeyEvent {};
+struct Input_MouseEvent { int action = 0; int button = 0; };
+struct Input_KeyEvent { int action = 0; int code = 0; };
+namespace host_input {
+inline int keyResult = 0;
+inline int mouseResult = 0;
+inline std::vector<Input_KeyEvent> keyEvents;
+inline std::vector<Input_MouseEvent> mouseEvents;
+}
 typedef void (*Input_InjectionCallback)(Input_InjectionStatus);
 static inline Input_Result OH_Input_RequestInjection(Input_InjectionCallback) { return 0; }
 static inline Input_Result OH_Input_QueryAuthorizedStatus(Input_InjectionStatus* s) { *s = AUTHORIZED; return 0; }
 static inline void OH_Input_CancelInjection() {}
-static inline Input_MouseEvent* OH_Input_CreateMouseEvent() { return nullptr; }
-static inline void OH_Input_DestroyMouseEvent(Input_MouseEvent**) {}
-static inline void OH_Input_SetMouseEventAction(Input_MouseEvent*, int) {}
+static inline Input_MouseEvent* OH_Input_CreateMouseEvent() { return new Input_MouseEvent; }
+static inline void OH_Input_DestroyMouseEvent(Input_MouseEvent** e) { delete *e; *e = nullptr; }
+static inline void OH_Input_SetMouseEventAction(Input_MouseEvent* e, int action) { e->action = action; }
 static inline void OH_Input_SetMouseEventDisplayX(Input_MouseEvent*, int) {}
 static inline void OH_Input_SetMouseEventDisplayY(Input_MouseEvent*, int) {}
 static inline void OH_Input_SetMouseEventGlobalX(Input_MouseEvent*, int) {}
 static inline void OH_Input_SetMouseEventGlobalY(Input_MouseEvent*, int) {}
-static inline void OH_Input_SetMouseEventButton(Input_MouseEvent*, int) {}
+static inline void OH_Input_SetMouseEventButton(Input_MouseEvent* e, int button) { e->button = button; }
 static inline void OH_Input_SetMouseEventAxisType(Input_MouseEvent*, int) {}
 static inline void OH_Input_SetMouseEventAxisValue(Input_MouseEvent*, float) {}
 static inline void OH_Input_SetMouseEventActionTime(Input_MouseEvent*, int64_t) {}
-static inline int OH_Input_InjectMouseEventGlobal(Input_MouseEvent*) { return 0; }
-static inline Input_KeyEvent* OH_Input_CreateKeyEvent() { return nullptr; }
-static inline void OH_Input_DestroyKeyEvent(Input_KeyEvent**) {}
-static inline void OH_Input_SetKeyEventAction(Input_KeyEvent*, int) {}
-static inline void OH_Input_SetKeyEventKeyCode(Input_KeyEvent*, int) {}
+static inline int OH_Input_InjectMouseEventGlobal(Input_MouseEvent* e) {
+    host_input::mouseEvents.push_back(*e);
+    return host_input::mouseResult;
+}
+static inline Input_KeyEvent* OH_Input_CreateKeyEvent() { return new Input_KeyEvent; }
+static inline void OH_Input_DestroyKeyEvent(Input_KeyEvent** e) { delete *e; *e = nullptr; }
+static inline void OH_Input_SetKeyEventAction(Input_KeyEvent* e, int action) { e->action = action; }
+static inline void OH_Input_SetKeyEventKeyCode(Input_KeyEvent* e, int code) { e->code = code; }
 static inline void OH_Input_SetKeyEventActionTime(Input_KeyEvent*, int64_t) {}
-static inline int OH_Input_InjectKeyEvent(Input_KeyEvent*) { return 0; }
+static inline int OH_Input_InjectKeyEvent(Input_KeyEvent* e) {
+    host_input::keyEvents.push_back(*e);
+    return host_input::keyResult;
+}
 // --- extra stubs for napi_init.cpp interceptors ---
 struct Input_TouchEvent {};
 struct Input_AxisEvent {};

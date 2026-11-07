@@ -277,14 +277,18 @@ int32_t DeskflowClient::serverOptionValue(uint32_t id, int32_t fallback) const
 
 void DeskflowClient::releaseStuckInputs()
 {
-    for (auto& [buttonId, down] : m_mouseButtonsDown) {
-        if (down) {
-            injectMouseButton(buttonId, false);
+    // Retry transient injection failures, retaining any still-held input
+    // so the next session can retry instead of forgetting a stuck key.
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        for (auto& [buttonId, down] : m_mouseButtonsDown) {
+            if (down) {
+                injectMouseButton(buttonId, false);
+            }
         }
-    }
-    for (auto& [keysym, down] : m_keyStates) {
-        if (down) {
-            injectKeyEvent(keysym, false);
+        for (auto& [keysym, down] : m_keyStates) {
+            if (down) {
+                setKeyState(keysym, false);
+            }
         }
     }
 }
@@ -294,8 +298,14 @@ void DeskflowClient::resetSessionState(bool releaseInputs)
     if (releaseInputs) {
         releaseStuckInputs();
     }
-    m_mouseButtonsDown.clear();
-    m_keyStates.clear();
+    for (auto it = m_mouseButtonsDown.begin(); it != m_mouseButtonsDown.end();) {
+        if (!it->second) it = m_mouseButtonsDown.erase(it);
+        else ++it;
+    }
+    for (auto it = m_keyStates.begin(); it != m_keyStates.end();) {
+        if (!it->second) it = m_keyStates.erase(it);
+        else ++it;
+    }
     m_active = false;
     m_handshakeDone = false;
     m_seqNum = 0;
@@ -531,7 +541,7 @@ void DeskflowClient::run()
 // 单次连接生命周期：连接 → 握手 → 消息循环。运行期断开返回 true（可重连），否则 false。
 bool DeskflowClient::runOnce()
 {
-    resetSessionState(false);
+    resetSessionState(true);
     setStatus("connecting to " + m_host + ":" + std::to_string(m_port));
     DF_LOGI("connecting to %{public}s:%{public}d", m_host.c_str(), m_port);
     if (!m_stream.connect(m_host, m_port, 5000)) {
@@ -704,19 +714,7 @@ bool DeskflowClient::handleMessage(const std::string& key)
     }
     if (key == "COUT") {
         m_active = false;
-        // 离开屏幕：抬起仍按下的按钮与按键（防止粘滞），再清空状态。
-        for (auto& [buttonId, down] : m_mouseButtonsDown) {
-            if (down) {
-                injectMouseButton(buttonId, false);
-            }
-        }
-        m_mouseButtonsDown.clear();
-        for (auto& [keysym, down] : m_keyStates) {
-            if (down) {
-                injectKeyEvent(keysym, false);
-            }
-        }
-        m_keyStates.clear();
+        releaseStuckInputs();
         setStatus("inactive: moved back to primary screen");
         return true;
     }
@@ -794,12 +792,9 @@ bool DeskflowClient::handleMessage(const std::string& key)
         } else if (!ProtoUtil::readf(m_stream, kMsgDKeyDown1_0 + 4, &id, &mask)) {
             return false;
         }
-        syncModifiers(static_cast<uint32_t>(mask));
-        uint32_t k = static_cast<uint32_t>(id);
-        if (!m_keyStates[k]) {
-            injectKeyEvent(k, true);
-            m_keyStates[k] = true;
-        }
+        if (!syncModifiers(static_cast<uint32_t>(mask))) return true;
+        uint32_t k = static_cast<uint16_t>(id);
+        setKeyState(k, true);
         return true;
     }
     if (key == "DKUP") {
@@ -812,11 +807,8 @@ bool DeskflowClient::handleMessage(const std::string& key)
             return false;
         }
         syncModifiers(static_cast<uint32_t>(mask));
-        uint32_t k = static_cast<uint32_t>(id);
-        if (m_keyStates[k]) {
-            injectKeyEvent(k, false);
-            m_keyStates[k] = false;
-        }
+        uint32_t k = static_cast<uint16_t>(id);
+        setKeyState(k, false);
         return true;
     }
     if (key == "DKRP") {
@@ -825,19 +817,18 @@ bool DeskflowClient::handleMessage(const std::string& key)
         if (!ProtoUtil::readf(m_stream, kMsgDKeyRepeat + 4, &id, &mask, &count, &button, &lang)) {
             return false;
         }
-        syncModifiers(static_cast<uint32_t>(mask));
-        uint32_t k = static_cast<uint32_t>(id);
+        if (!syncModifiers(static_cast<uint32_t>(mask))) return true;
+        uint32_t k = static_cast<uint16_t>(id);
         // 按住重复：count 是自上次以来的重复次数。已按下的键再发 DOWN
         // 即为系统可识别的重复事件；未按下时先补一次 DOWN。
         // 上限 32，防止异常 count 引发注入风暴。
         int32_t repeats = count < 0 ? 0 : (count > 32 ? 32 : count);
         if (!m_keyStates[k]) {
-            injectKeyEvent(k, true);
-            m_keyStates[k] = true;
+            if (!setKeyState(k, true)) return true;
             --repeats;
         }
         for (int32_t i = 0; i < repeats; ++i) {
-            injectKeyEvent(k, true);
+            if (!setKeyState(k, true, true)) break;
         }
         return true;
     }
@@ -847,12 +838,9 @@ bool DeskflowClient::handleMessage(const std::string& key)
         if (!ProtoUtil::readf(m_stream, kMsgDKeyDownLang + 4, &id, &mask, &button, &lang)) {
             return false;
         }
-        syncModifiers(static_cast<uint32_t>(mask));
-        uint32_t k = static_cast<uint32_t>(id);
-        if (!m_keyStates[k]) {
-            injectKeyEvent(k, true);
-            m_keyStates[k] = true;
-        }
+        if (!syncModifiers(static_cast<uint32_t>(mask))) return true;
+        uint32_t k = static_cast<uint16_t>(id);
+        setKeyState(k, true);
         return true;
     }
 
@@ -1079,7 +1067,7 @@ uint32_t DeskflowClient::maskModifierKeysym(uint32_t maskBit) const
 
 // 使本地修饰键按下状态与协议 mask 一致：
 // mask 置位但未按下的 -> 注入按下；mask 未置位但按下的 -> 注入抬起
-void DeskflowClient::syncModifiers(uint32_t mask)
+bool DeskflowClient::syncModifiers(uint32_t mask)
 {
     static const uint32_t kModBits[] = {
         kKeyModifierShift, kKeyModifierControl, kKeyModifierAlt,
@@ -1088,21 +1076,16 @@ void DeskflowClient::syncModifiers(uint32_t mask)
         // 大小写锁定会在两端漂移。
         kKeyModifierCapsLock, kKeyModifierNumLock, kKeyModifierScrollLock
     };
+    bool ok = true;
     for (uint32_t bit : kModBits) {
         uint32_t keysym = maskModifierKeysym(bit);
         if (keysym == kKeyNone) {
             continue;
         }
         bool wantDown = (mask & bit) != 0;
-        bool isDown = m_keyStates.count(keysym) > 0 && m_keyStates[keysym];
-        if (wantDown && !isDown) {
-            injectKeyEvent(keysym, true);
-            m_keyStates[keysym] = true;
-        } else if (!wantDown && isDown) {
-            injectKeyEvent(keysym, false);
-            m_keyStates[keysym] = false;
-        }
+        ok = setKeyState(keysym, wantDown) && ok;
     }
+    return ok;
 }
 
 // ---------- injection helpers ----------
@@ -1156,7 +1139,6 @@ bool DeskflowClient::injectMouseButton(int32_t buttonId, bool down)
         }
         return false;
     }
-    m_mouseButtonsDown[buttonId] = down;
     int32_t x = m_pointerX.load();
     int32_t y = m_pointerY.load();
     // 同 injectMouseMove：edge 坐标为 0 时 OH_Input_InjectMouseEventGlobal 返回 401，
@@ -1180,6 +1162,8 @@ bool DeskflowClient::injectMouseButton(int32_t buttonId, bool down)
     if (ret != INPUT_SUCCESS) {
         DF_LOGE("injectMouseButton(%{public}d,%{public}d) at (%{public}d,%{public}d) failed ret=%{public}d",
             buttonId, down ? 1 : 0, x, y, ret);
+    } else {
+        m_mouseButtonsDown[buttonId] = down;
     }
     return ret == INPUT_SUCCESS;
 }
@@ -1238,6 +1222,26 @@ bool DeskflowClient::injectMouseWheelAxis(int32_t x, int32_t y, int32_t axisType
             return false;
         }
     }
+    return true;
+}
+
+bool DeskflowClient::setKeyState(uint32_t keysym, bool down, bool repeat)
+{
+    keysym &= 0xFFFF;
+    const int32_t code = keysymToKeycode(keysym);
+    if (code < 0) return false;
+    const bool wasDown = m_keyStates.count(keysym) > 0 && m_keyStates[keysym];
+    if (wasDown == down && !repeat) return true;
+    // Aliases (for example Meta and Super) share one physical key.
+    // Only the first DOWN and last UP should reach the input system.
+    for (const auto& [other, held] : m_keyStates) {
+        if (other != keysym && held && keysymToKeycode(other) == code && !repeat) {
+            m_keyStates[keysym] = down;
+            return true;
+        }
+    }
+    if (!injectKeyEvent(keysym, down)) return false;
+    m_keyStates[keysym] = down;
     return true;
 }
 
