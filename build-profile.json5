@@ -1,31 +1,9 @@
-/*
- * Copyright (c) 2025 Huawei Device Co., Ltd.
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
-/*
- * 说明：真实签名信息（证书 .cer / profile .p7b / 密钥库 .p12 及密码）存放在用户主目录
- * `~/.ohos/config/` 下，**不会**提交到 Git 仓库，也不应出现在本文件中。
- * 每位开发者用 DevEco Studio 打开工程后，在 File → Project Structure → Signing Configs
- * 里勾选 "Automatically generate signature" 自行生成并绑定到本机，
- * DevEco 会在本地把 signingConfigs 写回本文件（仅本机可见，若你看到签名段出现，
- * 请在提交前删除，或把本文件加入 .git/info/exclude 并维护本地副本）。
- */
 {
   "app": {
     "products": [
       {
         "name": "default",
+        "signingConfig": "default",
         "compatibleSdkVersion": "5.0.0(12)",
         "targetSdkVersion": "6.0.0(20)",
         "runtimeOS": "HarmonyOS",
@@ -44,6 +22,21 @@
       },
       {
         "name": "release"
+      }
+    ],
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "C:\\Users\\lx182\\.ohos\\config\\default_deskflow-harmonyos_Cf_2GAXdFDZx0Na5JOgsJuri3iXWCaJzbHWjxvU-HMo=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001BB028C4F8A0D245DD6FE12DBC4438556B189D25B5D558351C977698E0229BE55D2CCB9B3A5B3D06",
+          "profile": "C:\\Users\\lx182\\.ohos\\config\\default_deskflow-harmonyos_Cf_2GAXdFDZx0Na5JOgsJuri3iXWCaJzbHWjxvU-HMo=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "C:\\Users\\lx182\\.ohos\\config\\default_deskflow-harmonyos_Cf_2GAXdFDZx0Na5JOgsJuri3iXWCaJzbHWjxvU-HMo=.p12",
+          "storePassword": "0000001B3C7DB5DD9052A711406F1F39C6E9EE5FFA6B9369BEF34170D1B63D04599638995F3F0BF8EEA4F6"
+        }
       }
     ]
   },
