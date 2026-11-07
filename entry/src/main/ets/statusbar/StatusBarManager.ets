@@ -38,6 +38,8 @@ export class StatusBarManager {
   private context: common.Context | null = null;
   private added: boolean = false;
   private state: number = ConnState.DISCONNECTED;
+  // 托盘图标缓存：之前每次 updateState 都重新读盘解码 6 张 SVG。
+  private iconCache: Map<string, statusBarManager.StatusBarIcon> = new Map();
 
   // 菜单点击回调
   onConnectClick?: () => void;
@@ -155,9 +157,13 @@ export class StatusBarManager {
     hilog.info(DOMAIN, TAG, 'updateState applied state=%{public}d', state);
   }
 
-  /** 生成三态图标（white/black 用同一状态色图标） */
+  /** 生成三态图标（white/black 用同一状态色图标），按状态缓存 PixelMap */
   private async loadIcons(state: number): Promise<statusBarManager.StatusBarIcon | null> {
     const shapeName = this.iconShapeName(state);
+    const cached = this.iconCache.get(shapeName);
+    if (cached) {
+      return cached;
+    }
     const ctx = this.context;
     if (!ctx) {
       return null;
@@ -170,7 +176,9 @@ export class StatusBarManager {
       if (!white || !black) {
         return null;
       }
-      return { white: white, black: black };
+      const icons: statusBarManager.StatusBarIcon = { white: white, black: black };
+      this.iconCache.set(shapeName, icons);
+      return icons;
     } catch (err) {
       hilog.error(DOMAIN, TAG, 'loadIcons %{public}d failed: code=%{public}d msg=%{public}s',
         state, (err as BusinessError).code, (err as BusinessError).message);
@@ -213,8 +221,10 @@ export class StatusBarManager {
   /** 依据状态构建右键菜单 */
   private buildMenu(state: number): statusBarManager.StatusBarGroupMenu[] {
     const group: statusBarManager.StatusBarGroupMenu = [];
+    // 状态项之前没有 menuCode，点击无反应；现在点它打开主界面。
     const statusItem: statusBarManager.StatusBarMenuItem = {
       title: this.stateHoverTips(state),
+      menuCode: MENU_SHOW_MAIN,
       menuAction: { abilityName: 'EntryAbility', notifyOnly: true }
     };
     group.push(statusItem);

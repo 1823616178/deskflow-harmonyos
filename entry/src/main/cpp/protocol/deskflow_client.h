@@ -7,6 +7,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -14,6 +15,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "socket_stream.h"
 
@@ -62,8 +64,13 @@ public:
     // 反转滚轮方向：true 时注入的垂直滚轮取反（配合系统滚轮方向偏好）。
     void setInvertScroll(bool invert) { m_invertScroll = invert; }
 
-    // Request stop and disconnect (non-blocking; worker thread detaches)
+    // Request stop and disconnect (non-blocking; worker thread exits
+    // promptly because interrupt() wakes the socket out of recv()).
     void stop();
+
+    // Block until the worker thread has exited (no-op if not running).
+    // Call from a background thread, never from the JS thread.
+    void waitForExit();
 
     bool isRunning() const { return m_running.load(); }
 
@@ -87,6 +94,21 @@ public:
 private:
     void run();                              // worker thread: (re)connect loop
     bool runOnce();                          // one connect→handshake→message-loop lifecycle
+    // Reset per-connection state (keys/buttons/handshake/clipboard).
+    // If releaseInputs is true, still-held keys/buttons are injected
+    // UP first so nothing stays stuck locally after a disconnect.
+    void resetSessionState(bool releaseInputs);
+    void releaseStuckInputs();
+    static int64_t nowMs();
+    // Negotiated protocol minor version (from Hello), and the raw
+    // DSOP option words sent by the server (kept, not discarded).
+    // NOTE: numeric DSOP option ids are upstream-defined; they are
+    // stored + logged here and looked up via serverOptionValue() so a
+    // guessed id can never silently disable a feature.
+    int16_t m_protocolMinor = 8;
+    std::vector<uint32_t> m_serverOptions;
+    int32_t serverOptionValue(uint32_t id, int32_t fallback) const;
+    std::atomic<int64_t> m_lastFrameTimeMs{0};
     bool handshake();                        // Barrier Hello/HelloBack exchange
     bool handleMessage(const std::string& key);  // dispatch one 4-byte protocol message key
     void setStatus(const std::string& s);    // notify status callback (worker thread)
@@ -95,7 +117,9 @@ private:
     bool injectMouseMove(int32_t x, int32_t y);
     bool injectMouseButton(int32_t buttonId, bool down);
     bool injectMouseWheel(int32_t xDelta, int32_t yDelta);
+    bool injectMouseWheelAxis(int32_t x, int32_t y, int32_t axisType, float axisValue);
     bool injectKeyEvent(uint32_t keysym, bool down);
+    bool setKeyState(uint32_t keysym, bool down, bool repeat = false);
 
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_stopRequested{false};
@@ -123,15 +147,13 @@ private:
     std::atomic<int32_t> m_pointerX{0};
     std::atomic<int32_t> m_pointerY{0};
     bool m_active = false;
-    bool m_handshakeDone = false;   // 收到 DSOP 后进入运行期（此后每条消息回 CNOP）
-    uint32_t m_seqNum = 0;          // 最近 CINN 的会话序号（剪贴板用）
+    std::atomic<bool> m_handshakeDone{false}; // also read by clipboard sender
+    std::atomic<uint32_t> m_seqNum{0};       // 最近 CINN 的会话序号（剪贴板用）
     // 剪贴板同步开关（ArkTS 开关控制）
     std::atomic<bool> m_clipboardSync{false};
     // 远程剪贴板文本回调（worker → JS，经 NAPI tsfn 投递）——用下面的 mutex 保护
     ClipboardCallback m_clipboardCb;
-    // 剪贴板内容 id / seq（barrier 用区分与失效判定）
-    uint32_t m_clipboardSeq = 1;
-    // 上一份推送/接收到的剪贴板文本（用于忽略本机回环）
+    // 上一份推送/接收到的剪贴板文本（用于忽略本机回环 / 重复推送）
     std::string m_lastClipboardText;
     // 保护 m_clipboardCb / m_clipboardSeq / m_lastClipboardText
     std::mutex m_clipboardMutex;
@@ -144,6 +166,7 @@ private:
         std::string buffer;           // 已收到的数据拼装缓冲
         size_t expectedSize = 0;      // 声明大小
         uint32_t clipSeq = 0;         // 本次分块的 seq
+        int64_t startTimeMs = 0;      // 首块到达时间（steady_clock ms），用于组装超时
     };
     ClipChunkState m_clipChunk;       // 跨消息保留状态（仅 worker 线程访问，无需锁）
 
@@ -157,7 +180,7 @@ private:
     // MOVE 注入必须携带当前按下的按钮（真实事件流如此，devecocli 抓包确认）
     std::map<int32_t, bool> m_mouseButtonsDown;
     // 同步修饰键状态到 mask（注入缺失的按下/多余的抬起）
-    void syncModifiers(uint32_t mask);
+    bool syncModifiers(uint32_t mask);
     uint32_t maskModifierKeysym(uint32_t maskBit) const;
 };
 

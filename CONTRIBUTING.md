@@ -5,8 +5,9 @@
 ## 项目现状
 
 这是一个 **Deskflow fork**，聚焦于让鸿蒙电脑（HarmonyOS 6 / API 20+，PC/2in1）作为
-Deskflow/Barrier 协议客户端接入服务端。当前核心链路（握手、消息循环、鼠标/键盘/滚轮注入、
-双向切换）已可用；**剪贴板同步、断线自动重连、错误分类**等尚未实现，是很好的切入点。
+Deskflow/Barrier 协议客户端接入服务端。当前核心链路（握手、消息循环、鼠标/键盘/滚轮注入、双向切换、
+剪贴板文本同步、断线自动重连与错误分类、托盘常驻）已可用；
+**文件传输/拖拽、多显示器、剪贴板图片**等尚未实现，是很好的切入点。
 
 ## 如何开始
 
@@ -32,8 +33,17 @@ Deskflow/Barrier 协议客户端接入服务端。当前核心链路（握手、
    - **协议层**（`entry/src/main/cpp/protocol/`）保持与 deskflow 一致的
      `GPL-2.0-only WITH LicenseRef-OpenSSL-Exception` 文件头，并保留来源版权致谢。
    - **NAPI/UI**（`napi_init.cpp`、`index.ets`）保留 `Apache-2.0` 文件头。
-   - 新增消息处理统一检查 `readf` 返回值，读取失败即返回 `false`，避免负载残留污染下一帧对齐
+   - 新增消息处理统一检查 `readf` 返回值，读取失败即返回 `false`；解析被严格限制
+     在当前帧内（`SocketStream::readExact` 不会越帧读走下一帧），不要绕过帧边界
      （详见 `docs/TROUBLESHOOTING.md` §7）。
+   - NAPI 新增入口先走 `GetStringArg/GetIntArg/GetBoolArg` 校验参数、失败返回
+     `error: ...`，不要用默认值静默执行；新增 tsfn 走统一的 `CreateTsfn()`，
+     不要手写 `napi_create_threadsafe_function`（`OnChange` 曾因此传 NULL
+     资源名而注册失败）。
+   - 跨进程设置走 `BGEVT_SETTINGS` commonEvent 发给后台承载进程，不要在 UI
+     进程直接调 `deskflow.set*`（调的是空客户端）。
+   - 每次修复一个大功能单独提交一次（一个 PR 一个主题），不要把多项修复
+     混进一个提交。
    - 注入事件 `actionTime` 一律传 `-1`，坐标用 vp 且 `displayX/Y` 与 `globalX/Y` 双设
      （详见 `docs/INPUT_INJECTION.md`）。
    - 不加个人/机器相关绝对路径，不提交签名文件与密码。

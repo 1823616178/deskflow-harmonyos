@@ -28,6 +28,9 @@ export const cancelInjection: () => string;
 export const injectMouseClickGlobal: (x: number, y: number) => string;
 export const injectMouseTrail: (x0: number, y0: number, x1: number, y1: number, steps: number, intervalMs: number) => string;
 export const injectKey: (keyCode: number) => string;
+// value is the raw native status string (e.g. 'handshake ok, waiting for enter ...').
+// BackGroundAbility maps it to a structured {code, message} JSON payload
+// before broadcasting it to the UI via commonEvent; see BGEVT_STATUS.
 export const onDeskflowStatus: (callback: (event: ValueChangeEvent) => void) => void;
 export const onClipboardData: (callback: (event: ValueChangeEvent) => void) => void;
 export const pushClipboard: (text: string) => string;

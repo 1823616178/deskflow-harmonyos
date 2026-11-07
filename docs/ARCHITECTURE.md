@@ -50,8 +50,10 @@
 
 | 层 | 文件 | 职责 |
 |---|---|---|
-| **ETS UI** | `ets/pages/Index.ets` | 参数输入、接口调用、状态展示（`connStatus` / `result`） |
-| **NAPI 桥接** | `cpp/napi_init.cpp` | 导出 JS 接口、管理线程安全函数、事件拦截诊断、注入授权/注入演示 |
+| **ETS UI** | `ets/pages/Index.ets` | 参数输入、设置开关、剪贴板 PasteButton、状态展示；设置变更经 `BGEVT_SETTINGS` 发给后台承载进程，不在 UI 进程调 `deskflow.set*` |
+| **后台承载** | `ets/background/BackGroundAbility.ets` | 独立进程持有真实连接；状态映射为 `{code, message}` JSON 经 `BGEVT_STATUS` 广播回 UI |
+| **托盘** | `ets/statusbar/StatusBarManager.ets` | 三态图标（带缓存）+ 右键菜单；快览页经 `BGEVT_STATUS` 拿状态 |
+| **NAPI 桥接** | `cpp/napi_init.cpp` | 导出 JS 接口、管理线程安全函数、事件拦截诊断、注入授权/注入演示；三路 tsfn 共用 `CreateTsfn()` |
 | **协议客户端** | `cpp/protocol/deskflow_client.{h,cpp}` | 连接、握手、消息循环、消息分发、调用注入接口 |
 | **协议编解码** | `cpp/protocol/proto_util.{h,cpp}` `protocol_types.h` | 格式串读写、消息常量、键码/按钮定义 |
 | **传输** | `cpp/protocol/socket_stream.{h,cpp}` | 4 字节 NBO 长度前缀帧封拆、`readExact`/`writeAll`/`select` 连接 |
@@ -71,13 +73,14 @@ C++ 协议工作线程 / MMI IPC 回调线程不能直接操作 JS。桥接层�
 
 - `g_statusTsfn`：由 `nest thread` 的 `DeskflowStatusCb` 投递**状态字符串**到 JS 线程，更新 `onDeskflowStatus` 回调（连接/握手/进入屏幕等状态）。
 - `g_tsfn`：由事件拦截回调（按键/鼠标/触摸/轴）与授权回调投递**诊断事件**，更新 `onChange`。
-- 两者都用 `napi_tsfn_nonblocking` 投递：**JS 线程繁忙时不阻塞协议/回调线程**，避免死锁（见 `TROUBLESHOOTING.md` §8 / `INPUT_INJECTION.md` §8）。
+- 两者都用 `napi_tsfn_nonblocking` 投递：**JS 线程繁忙时不阻塞协议/回调线程**，避免死锁（见 `TROUBLESHOOTING.md` §8 / `INPUT_INJECTION.md` §8）。三路 tsfn 共用 `CreateTsfn()` 创建，资源名不得传 NULL（`OnChange` 曾因此注册失败）。
 
 ### 3.3 诊断拦截器
 
-页面提供「Add/Remove input event interceptor」按钮**显式开关**诊断拦截器：把真实鼠标 / 触摸 / 轴事件
+诊断拦截器（`Add/Remove input event interceptor`，NAPI 层提供）把真实鼠标 / 触摸 / 轴事件
 打到 `hilog`（并回投 `onChange` 展示），用于与注入事件做对比，定位注入差异（如 actionTime 坑）。
-为避免正常使用的持续刷屏，拦截器**不在连接时自动注册**，仅在用户点按钮时启用。
+为避免正常使用的持续刷屏，拦截器**不在连接时自动注册**，仅在需要诊断时显式启用。
+注意：当前主界面未提供开关按钮，诊断需经 NAPI 直接调用。
 
 ### 3.4 注入演示接口（独立于协议注入）
 
@@ -106,7 +109,7 @@ C++ 协议工作线程 / MMI IPC 回调线程不能直接操作 JS。桥接层�
            → writeFrame(HostBack)   # 携带 screenName
            → OH_Input_RequestInjection(...)  # 自动申请注入授权
            → 消息循环
-      # 断开后：根据 runOnce 返回值 + 错误分类决定是否重连（默认 3s 间隔）
+      # 断开后：根据 runOnce 返回值 + 错误分类决定是否重连（指数退避 3s 起，最高 30s）
 ```
 
 ### 4.2 消息循环与分发
@@ -115,8 +118,8 @@ C++ 协议工作线程 / MMI IPC 回调线程不能直接操作 JS。桥接层�
 while (keepGoing && !stop):
     frame = readFrame()          # 4B NBO 长度 + payload
     key   = frame[0..4]          # 消息类型
-    handled = handleMessage(key)  # 按字面量 key 分发，按格式读参
-    if handshakeDone: writeFrame("CNOP")   # 运行期回 CNOP
+    handled = handleMessage(key)  # 按字面量 key 分发，按格式读参（严格限制在当前帧内）
+    if handshakeDone: writeFrame("CNOP")   # 运行期回 CNOP（CALV 除外，它已回 CALV）
 ```
 
 - `handleMessage` 先读 4 字节 key，再依各消息格式读取参数（`kMsgXxx + 4` 跳过 key）。
@@ -128,7 +131,7 @@ while (keepGoing && !stop):
 
 ### 4.3 运行期确认
 
-收到 `DSOP` 后 `m_handshakeDone = true`，此后每条消息处理完回一次 `CNOP`，绕开服务端"BSD 延迟 ACK"等待（`PROTOCOL.md` §5）。
+收到 `DSOP` 后 `m_handshakeDone = true`，此后除 `CALV` 外每条消息处理完回一次 `CNOP`；`CALV` 只回复 `CALV`，绕开服务端"BSD 延迟 ACK"等待（`PROTOCOL.md` §5）。
 
 ### 4.4 注入数据流
 
