@@ -13,6 +13,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { display } from '@kit.ArkUI';
 import deskflow from 'libentry.so';
 import { ClipboardAssembler, ClipboardChunk, splitClipboardText } from './ClipboardTransfer';
+import { tlsPreferenceKey } from './TlsSettings';
 
 const DOMAIN = 0x0000;
 const TAG = 'DeskflowBG';
@@ -35,6 +36,7 @@ export default class BackGroundAbility extends UIAbility {
   private settingsSub: commonEventManager.CommonEventSubscriber | null = null;
   private statusRequestSub: commonEventManager.CommonEventSubscriber | null = null;
   private lastStatus: string = JSON.stringify({ code: 'disconnected', message: '未连接' });
+  private peer: string = '';
   // 分片剪贴板重组：id -> {parts, total, received, receivedAt}
   private clipChunks: ClipboardAssembler = new ClipboardAssembler();
 
@@ -49,10 +51,13 @@ export default class BackGroundAbility extends UIAbility {
       return;
     }
     const port = Number(want.parameters?.['port'] ?? 24800);
+    this.peer = tlsPreferenceKey(host, port);
     const screen = (want.parameters?.['screen'] as string) ?? 'HarmonyPC';
     const invert = want.parameters?.['invert'] === true;
     const autoReconnect = want.parameters?.['autoreconnect'] !== false;
     const clipboard = want.parameters?.['clipboard'] === true;
+    const tlsEnabled = want.parameters?.['tlsEnabled'] !== false;
+    const tlsFingerprint = (want.parameters?.['tlsFingerprint'] as string) ?? '';
 
     try {
       const d = display.getDefaultDisplaySync();
@@ -61,13 +66,18 @@ export default class BackGroundAbility extends UIAbility {
       deskflow.setInvertScroll(invert);
       deskflow.setAutoReconnect(autoReconnect);
       deskflow.setClipboardSync(clipboard);
-      deskflow.connectDeskflow(host, port, screen, w, h);
+      const result = deskflow.connectDeskflow(host, port, screen, w, h,
+        tlsEnabled, tlsFingerprint, `${this.context.filesDir}/deskflow-client.pem`);
+      if (result.indexOf('error:') === 0) {
+        this.lastStatus = JSON.stringify({ code: 'error', message: result, peer: this.peer });
+        this.publish({ event: BGEVT_STATUS, data: this.lastStatus });
+      }
       hilog.info(DOMAIN, TAG, 'connect %{public}s:%{public}d', host, port);
     } catch (e) {
       hilog.error(DOMAIN, TAG, 'connect/push failed: %{public}s', JSON.stringify(e));
       const err = e as BusinessError;
       this.publish({ event: BGEVT_STATUS,
-        data: JSON.stringify({ code: 'error', message: `connect failed (${err.code}): ${err.message}` }) });
+        data: JSON.stringify({ code: 'error', message: `connect failed (${err.code}): ${err.message}`, peer: this.peer }) });
     }
     this.publish({ event: BGEVT_READY, data: 'ready' });
   }
@@ -102,7 +112,13 @@ export default class BackGroundAbility extends UIAbility {
     try {
       deskflow.onDeskflowStatus((event: deskflow.ValueChangeEvent) => {
         const msg = event.value ?? '';
-        const payload = JSON.stringify({ code: this.statusCode(msg), message: msg });
+        const identityPrefix = 'tls client fingerprint: ';
+        if (msg.indexOf(identityPrefix) === 0) {
+          this.publish({ event: BGEVT_STATUS,
+            data: JSON.stringify({ code: 'tls_identity', message: msg.substring(identityPrefix.length), peer: this.peer }) });
+          return;
+        }
+        const payload = JSON.stringify({ code: this.statusCode(msg), message: msg, peer: this.peer });
         this.lastStatus = payload;
         const data: commonEventManager.CommonEventData = { event: BGEVT_STATUS, data: payload };
         this.publish(data);

@@ -1,5 +1,13 @@
 # Third-Party Notices
 
+## Mbed TLS
+
+TLS uses the unmodified official Mbed TLS 3.6.7 source archive bundled in
+`third_party/mbedtls-3.6.7.tar.bz2`. Its source copyright and license notices
+are preserved in that archive. Mbed TLS is dual licensed under Apache-2.0
+OR GPL-2.0-or-later; the GPL-2.0 option is used for this GPL-2.0 project.
+See `third_party/MBEDTLS-LICENSE.txt` and `third_party/README.md`.
+
 ## Remix Icon
 
 The tray icon SVGs in `entry/src/main/resources/rawfile/tray/` are derived from

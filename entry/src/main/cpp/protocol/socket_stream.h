@@ -9,9 +9,11 @@
 #include <cstdint>
 #include <atomic>
 #include <mutex>
+#include <memory>
 #include <shared_mutex>
 #include <string>
 #include <vector>
+#include "tls_session.h"
 
 namespace dfpoc {
 
@@ -28,7 +30,11 @@ public:
     // On success the socket gets TCP_NODELAY, TCP keepalive and
     // SO_RCVTIMEO/SO_SNDTIMEO so a silently dead peer is detected
     // instead of blocking recv/write forever.
-    bool connect(const std::string& host, uint16_t port, int timeoutMs = 5000);
+    bool connect(const std::string& host, uint16_t port, int timeoutMs = 5000,
+                 const TlsOptions& tls = {});
+    const std::string& lastError() const { return m_lastError; }
+    const std::string& clientFingerprint() const { return m_clientFingerprint; }
+    bool tlsRejected() const { return m_tlsRejected; }
 
     // Read exactly n bytes.
     // When a frame is active (after pushToBuffer) reads are confined to
@@ -80,6 +86,13 @@ private:
     mutable std::shared_mutex m_socketMutex;
     std::mutex m_writeMutex;
     std::atomic<bool> m_writeFailed{false};
+    std::string m_lastError;
+    std::string m_clientFingerprint;
+    bool m_tlsRejected = false;
+    bool m_tlsPending = false; // guarded by m_socketMutex; no plaintext during TLS setup
+#ifdef DF_WITH_MBEDTLS
+    std::unique_ptr<TlsSession> m_tls;
+#endif
     bool m_readTimedOut{false};
     std::vector<uint8_t> m_buffer;
     size_t m_bufferPos;

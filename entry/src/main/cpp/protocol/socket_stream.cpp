@@ -60,6 +60,13 @@ SocketStream::SocketStream(SocketStream&& other) noexcept : SocketStream()
     m_buffer = std::move(other.m_buffer);
     m_bufferPos = std::exchange(other.m_bufferPos, 0);
     m_frameActive = std::exchange(other.m_frameActive, false);
+    m_lastError = std::move(other.m_lastError);
+    m_clientFingerprint = std::move(other.m_clientFingerprint);
+    m_tlsRejected = other.m_tlsRejected;
+    m_tlsPending = std::exchange(other.m_tlsPending, false);
+#ifdef DF_WITH_MBEDTLS
+    m_tls = std::move(other.m_tls);
+#endif
 }
 
 SocketStream::~SocketStream()
@@ -67,8 +74,18 @@ SocketStream::~SocketStream()
     close();
 }
 
-bool SocketStream::connect(const std::string& host, uint16_t port, int timeoutMs)
+bool SocketStream::connect(const std::string& host, uint16_t port, int timeoutMs, const TlsOptions& tls)
 {
+    m_lastError.clear();
+    m_clientFingerprint.clear();
+    m_tlsRejected = false;
+#ifndef DF_WITH_MBEDTLS
+    if (tls.enabled) {
+        m_lastError = "TLS_CONFIG_ERROR TLS support is missing from this build";
+        m_tlsRejected = true;
+        return false;
+    }
+#endif
     struct addrinfo hints;
     std::memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
@@ -150,9 +167,33 @@ bool SocketStream::connect(const std::string& host, uint16_t port, int timeoutMs
             }
             std::unique_lock<std::shared_mutex> lock(m_socketMutex);
             m_fd = fd;
+            m_tlsPending = tls.enabled;
             m_writeFailed = false;
             m_readTimedOut = false;
             freeaddrinfo(result);
+            lock.unlock();
+#ifdef DF_WITH_MBEDTLS
+            if (tls.enabled) {
+                auto secure = std::make_unique<TlsSession>();
+                bool ready;
+                {
+                    // Keep the descriptor alive while interrupt() can still wake the handshake.
+                    std::shared_lock<std::shared_mutex> ioLock(m_socketMutex);
+                    ready = secure->connect(fd, host, tls, timeoutMs, m_lastError);
+                    m_clientFingerprint = secure->clientFingerprint();
+                }
+                if (!ready) {
+                    m_tlsRejected = m_lastError.find("TLS_UNTRUSTED") == 0 ||
+                        m_lastError.find("TLS_PIN_MISMATCH") == 0 || m_lastError.find("TLS_CONFIG_ERROR") == 0;
+                    close();
+                    return false;
+                }
+                std::unique_lock<std::shared_mutex> tlsLock(m_socketMutex);
+                if (m_writeFailed.load()) return false;
+                m_tls = std::move(secure);
+                m_tlsPending = false;
+            }
+#endif
             return true;
         }
         ::close(fd);
@@ -189,10 +230,13 @@ size_t SocketStream::bufferRemaining() const
 bool SocketStream::readExactSocket(uint8_t* data, size_t n)
 {
     std::shared_lock<std::shared_mutex> lock(m_socketMutex);
-    if (m_fd < 0) {
+    if (m_fd < 0 || m_tlsPending) {
         return false;
     }
     m_readTimedOut = false;
+#ifdef DF_WITH_MBEDTLS
+    if (m_tls) return m_tls->readExact(data, n, kRecvTimeoutSec * 1000, m_readTimedOut);
+#endif
     const auto deadline = Clock::now() + std::chrono::seconds(kRecvTimeoutSec);
     size_t got = 0;
     while (got < n) {
@@ -237,6 +281,9 @@ bool SocketStream::readExact(uint8_t* data, size_t n)
 
 bool SocketStream::writeAllSocket(int fd, const uint8_t* data, size_t n)
 {
+#ifdef DF_WITH_MBEDTLS
+    if (m_tls) return m_tls->writeAll(data, n, kSendTimeoutSec * 1000);
+#endif
     const auto deadline = Clock::now() + std::chrono::seconds(kSendTimeoutSec);
     size_t sent = 0;
     while (sent < n) {
@@ -260,7 +307,7 @@ bool SocketStream::writeAll(const uint8_t* data, size_t n)
 {
     std::lock_guard<std::mutex> writeLock(m_writeMutex);
     std::shared_lock<std::shared_mutex> socketLock(m_socketMutex);
-    if (m_fd < 0 || m_writeFailed.load()) {
+    if (m_fd < 0 || m_writeFailed.load() || m_tlsPending) {
         return false;
     }
     if (writeAllSocket(m_fd, data, n)) {
@@ -311,7 +358,7 @@ bool SocketStream::writeFrame(const uint8_t* data, size_t n)
     // and heartbeat threads write at the same time.
     std::lock_guard<std::mutex> writeLock(m_writeMutex);
     std::shared_lock<std::shared_mutex> socketLock(m_socketMutex);
-    if (m_fd < 0 || m_writeFailed.load()) {
+    if (m_fd < 0 || m_writeFailed.load() || m_tlsPending) {
         return false;
     }
     if (writeAllSocket(m_fd, lenb, 4) && (n == 0 || writeAllSocket(m_fd, data, n))) {
@@ -346,13 +393,16 @@ void SocketStream::interrupt()
 bool SocketStream::isConnected() const
 {
     std::shared_lock<std::shared_mutex> lock(m_socketMutex);
-    return m_fd >= 0 && !m_writeFailed.load();
+    return m_fd >= 0 && !m_writeFailed.load() && !m_tlsPending;
 }
 
 void SocketStream::close()
 {
     interrupt();
     std::unique_lock<std::shared_mutex> lock(m_socketMutex);
+#ifdef DF_WITH_MBEDTLS
+    m_tls.reset();
+#endif
     if (m_fd >= 0) {
         ::close(m_fd);
         m_fd = -1;
@@ -360,6 +410,7 @@ void SocketStream::close()
     m_buffer.clear();
     m_bufferPos = 0;
     m_frameActive = false;
+    m_tlsPending = false;
 }
 
 } // namespace dfpoc

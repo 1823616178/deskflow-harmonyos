@@ -3,4 +3,5 @@
 export interface DeskflowStatusData {
   code: string;
   message: string;
+  peer?: string;
 }

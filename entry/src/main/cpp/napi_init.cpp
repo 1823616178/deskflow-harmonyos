@@ -277,16 +277,15 @@ static napi_value SetClipboardSync(napi_env env, napi_callback_info info)
     return MakeString(env, enable ? "clipboard sync ON" : "clipboard sync OFF");
 }
 
-// connectDeskflow(host, port, name, screenW, screenH): 后台线程连接 Deskflow server
+// connectDeskflow(host, port, name, screenW, screenH, tlsEnabled, fingerprint, identityPath)
 // 参数全部校验，失败即返回 error: ...，不再用默认值静默连接。
 // 旧客户端的停止等待在后台线程做：之前在 JS 线程 sleep 1.5s 会卡 UI。
 static napi_value ConnectDeskflow(napi_env env, napi_callback_info info)
 {
-    size_t argc = 5;
-    napi_value args[5];
-    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
-    if (argc < 5) {
-        return MakeString(env, "error: connectDeskflow requires host, port, name, screenW, screenH");
+    size_t argc = 8;
+    napi_value args[8];
+    if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok || argc < 8) {
+        return MakeString(env, "error: connectDeskflow requires connection and TLS options");
     }
     std::string host;
     if (!GetStringArg(env, args[0], host, 253) || host.empty()) {
@@ -305,6 +304,14 @@ static napi_value ConnectDeskflow(napi_env env, napi_callback_info info)
         screenW <= 0 || screenH <= 0 || screenW > 16384 || screenH > 16384) {
         return MakeString(env, "error: invalid screen size (must be 1-16384)");
     }
+    dfpoc::TlsOptions tls;
+    std::string fingerprint;
+    if (!GetBoolArg(env, args[5], tls.enabled) || !GetStringArg(env, args[6], fingerprint, 256) ||
+        !dfpoc::normalizeFingerprint(fingerprint, tls.serverFingerprint) ||
+        !GetStringArg(env, args[7], tls.identityPath, 4096) ||
+        (tls.enabled && (tls.identityPath.empty() || tls.identityPath.front() != '/'))) {
+        return MakeString(env, "error: invalid TLS options or SHA-256 fingerprint");
+    }
     if (g_connectInProgress.exchange(true)) {
         return MakeString(env, "error: a connect is already in progress");
     }
@@ -320,7 +327,7 @@ static napi_value ConnectDeskflow(napi_env env, napi_callback_info info)
         g_connectStarter.join();
     }
     // 后台线程等旧 worker 退出（join）后再启动新连接；JS 线程立即返回。
-    g_connectStarter = std::thread([host, port, name, screenW, screenH, generation] {
+    g_connectStarter = std::thread([host, port, name, screenW, screenH, generation, tls] {
         g_deskflowClient.waitForExit();
         std::lock_guard<std::mutex> lock(g_clientStartMutex);
         if (generation != g_connectGeneration.load()) {
@@ -337,7 +344,7 @@ static napi_value ConnectDeskflow(napi_env env, napi_callback_info info)
         g_deskflowClient.setClipboardCallback(DeskflowClipboardCb);
         g_deskflowClient.setScreenSize(screenW, screenH);
         // 是否自动重连由桌面侧通过 setAutoReconnect 控制（默认开启，这里不覆盖）
-        bool started = g_deskflowClient.start(host, static_cast<uint16_t>(port), name);
+        bool started = g_deskflowClient.start(host, static_cast<uint16_t>(port), name, tls);
         DF_LOGI("connectDeskflow: started=%{public}d", started ? 1 : 0);
         if (!started) {
             DeskflowStatusCb("error: client already running");

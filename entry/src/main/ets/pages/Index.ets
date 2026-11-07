@@ -24,6 +24,7 @@ import { desktopManager } from '../statusbar/DeskflowStatusStore';
 import { BGEVT_STATUS, BGEVT_CLIP, BGEVT_STOP, BGEVT_CLIP_PUSH, BGEVT_SETTINGS, BGEVT_READY } from '../background/BackGroundAbility';
 import { DeskflowStatusData } from '../background/DeskflowEventData';
 import { ClipboardAssembler, ClipboardChunk, splitClipboardText } from '../background/ClipboardTransfer';
+import { normalizeTlsFingerprint, tlsCertificateNotice, tlsPreferenceKey } from '../background/TlsSettings';
 
 const DOMAIN = 0x0000;
 const PREFS_NAME = 'deskflow_config';
@@ -33,6 +34,7 @@ const PREFS_NAME_FIELD = 'client_name';
 const PREFS_INVERT = 'invert_scroll';
 const PREFS_AUTORECONNECT = 'auto_reconnect';
 const PREFS_CLIPBOARD = 'clipboard_sync';
+const PREFS_TLS = 'tls_enabled';
 
 function stateColor(state: number): string {
   switch (state) {
@@ -63,6 +65,11 @@ struct Index {
   @State invertScroll: boolean = false;
   @State autoReconnect: boolean = true; // 默认开启自动重连/启动自动连接
   @State clipboardSync: boolean = true; // 默认开启剪贴板同步
+  @State tlsEnabled: boolean = true;
+  @State tlsFingerprint: string = '';
+  @State tlsClientFingerprint: string = '';
+  private activeTlsPeer: string = '';
+  private tlsPromptVisible: boolean = false;
   @State clipLast: string = ''; // 最近一次读取的本机剪贴板内容（按钮读取结果提示）
   // 剪贴板桥接：避免把刚写入的本机内容又当成本机新复制推回去（回环）
   private lastRemoteClipboard: string = '';
@@ -132,6 +139,9 @@ struct Index {
     if (this.screenName.trim().length > 64) {
       return '屏幕名过长（最多 64 字符）';
     }
+    if (this.tlsEnabled && normalizeTlsFingerprint(this.tlsFingerprint) === null) {
+      return '服务端指纹应为 64 位 SHA-256 十六进制值（可带冒号）';
+    }
     return null;
   }
 
@@ -154,7 +164,7 @@ struct Index {
     try {
       const parsed = JSON.parse(raw) as Record<string, string>;
       if (typeof parsed.code === 'string' && typeof parsed.message === 'string') {
-        return { code: parsed.code, message: parsed.message };
+        return { code: parsed.code, message: parsed.message, peer: parsed.peer };
       }
     } catch (e) {
       // 非 JSON：旧版纯文本状态
@@ -212,11 +222,17 @@ struct Index {
           this.publishSettings(); // replay changes made while the carrier was starting
         } else if (data?.event === BGEVT_STATUS) {
           const parsed = this.parseStatusPayload(`${data.data ?? ''}`);
+          if (parsed.peer && this.activeTlsPeer && parsed.peer !== this.activeTlsPeer) return;
+          if (parsed.code === 'tls_identity') {
+            if (parsed.peer === this.activeTlsPeer) this.tlsClientFingerprint = parsed.message;
+            return;
+          }
           this.statusText = parsed.message;
           if (parsed.code) {
             this.connState = this.mapStatusCode(parsed.code);
           }
           this.syncTray();
+          this.handleTlsCertificate(parsed);
         } else if (data?.event === BGEVT_CLIP) {
           try {
             const chunk = JSON.parse(`${data.data ?? ''}`) as ClipboardChunk;
@@ -235,6 +251,32 @@ struct Index {
     }
   }
 
+  private handleTlsCertificate(status: DeskflowStatusData): void {
+    const notice = tlsCertificateNotice(status.message);
+    const peer = tlsPreferenceKey(this.hostInput, Number(this.portInput));
+    if (notice === null || !this.tlsEnabled || this.tlsPromptVisible ||
+      status.peer !== this.activeTlsPeer || peer !== this.activeTlsPeer) return;
+    this.statusText = notice.changed ? '服务端证书已变更，请核对指纹' : '请核验服务端证书';
+    this.syncTray();
+    this.tlsPromptVisible = true;
+    this.getUIContext().showAlertDialog({
+      title: notice.changed ? '服务端证书已变更' : '信任服务端证书',
+      message: `请与 Windows Deskflow 设置中显示的 SHA-256 证书指纹核对，一致后再信任。\n\n${notice.fingerprint}`,
+      primaryButton: { value: '取消', action: () => { this.tlsPromptVisible = false; } },
+      secondaryButton: { value: '指纹一致，信任并重连', action: () => {
+        this.tlsPromptVisible = false;
+        if (tlsPreferenceKey(this.hostInput, Number(this.portInput)) !== peer || !this.tlsEnabled) return;
+        this.getPrefs().then(async (pref: preferences.Preferences) => {
+          pref.putSync(peer, notice.fingerprint);
+          await pref.flush();
+          this.tlsFingerprint = notice.fingerprint;
+          this.onConnect();
+        }).catch((e: Error) => { this.statusText = `保存证书信任失败: ${e.message}`; });
+      } },
+      cancel: () => { this.tlsPromptVisible = false; }
+    });
+  }
+
   /** 读取上次保存的连接配置（host/port/name/滚轮反转/自动重连） */
   private loadPrefs(): void {
     try {
@@ -245,6 +287,8 @@ struct Index {
         this.invertScroll = pref.getSync(PREFS_INVERT, false) as boolean;
         this.autoReconnect = pref.getSync(PREFS_AUTORECONNECT, true) as boolean;
         this.clipboardSync = pref.getSync(PREFS_CLIPBOARD, true) as boolean;
+        this.tlsEnabled = pref.getSync(PREFS_TLS, true) as boolean;
+        this.tlsFingerprint = pref.getSync(tlsPreferenceKey(this.hostInput, Number(this.portInput)), '') as string;
         // 启动自动连接：回填完配置后，若开启且地址可用，自动发起连接
         if (this.autoReconnect && this.hostInput.trim().length > 0 && this.connState === ConnState.DISCONNECTED) {
           hilog.info(DOMAIN, 'DeskflowPrefs', 'auto reconnect on launch, connecting...');
@@ -268,6 +312,7 @@ struct Index {
         pref.putSync(PREFS_INVERT, this.invertScroll);
         pref.putSync(PREFS_AUTORECONNECT, this.autoReconnect);
         pref.putSync(PREFS_CLIPBOARD, this.clipboardSync);
+        pref.putSync(PREFS_TLS, this.tlsEnabled);
         pref.flush().catch((e: Error) => {
           hilog.error(DOMAIN, 'DeskflowPrefs', 'flush prefs fail: %{public}s', e.message);
         });
@@ -453,19 +498,48 @@ struct Index {
         .width('100%')
         .height(42)
         .margin({ top: 10 })
-        .onChange((v: string) => { this.hostInput = v })
+        .enabled(this.connState !== ConnState.CONNECTING)
+        .onChange((v: string) => { this.hostInput = v; this.tlsFingerprint = '' })
       TextInput({ placeholder: '端口 (默认 24800)', text: this.portInput })
         .type(InputType.NUMBER_DECIMAL)
         .width('100%')
         .height(42)
         .margin({ top: 8 })
-        .onChange((v: string) => { this.portInput = v })
+        .enabled(this.connState !== ConnState.CONNECTING)
+        .onChange((v: string) => { this.portInput = v; this.tlsFingerprint = '' })
       TextInput({ placeholder: '屏幕名 (在服务端显示的名称)', text: this.screenName })
         .type(InputType.Normal)
         .width('100%')
         .height(42)
         .margin({ top: 8 })
         .onChange((v: string) => { this.screenName = v })
+      Row() {
+        Text('TLS 加密（推荐）').fontSize(14)
+        Blank()
+        Toggle({ type: ToggleType.Switch, isOn: this.tlsEnabled })
+          .selectedColor('#4CB050')
+          .enabled(this.connState !== ConnState.CONNECTING)
+          .onChange((value: boolean) => { this.tlsEnabled = value; this.savePrefs() })
+      }
+      .width('100%')
+      .margin({ top: 12 })
+      if (this.tlsEnabled) {
+        TextInput({ placeholder: '服务端 SHA-256 指纹（首次连接可留空）', text: this.tlsFingerprint })
+          .width('100%')
+          .margin({ top: 8 })
+          .enabled(this.connState !== ConnState.CONNECTING)
+          .onChange((value: string) => { this.tlsFingerprint = value })
+        Text('首次连接需核对证书指纹；修改安全设置后请重新连接。')
+          .fontSize(11).fontColor('#666666').margin({ top: 4 })
+        if (this.tlsClientFingerprint.length > 0) {
+          Text(`本机证书 SHA-256：${this.tlsClientFingerprint}`)
+            .fontSize(11).fontColor('#666666').copyOption(CopyOptions.LocalDevice)
+            .wordBreak(WordBreak.BREAK_ALL).margin({ top: 4 })
+        }
+      } else {
+        Text('明文连接，仅用于可信局域网。修改后请重新连接。')
+          .fontSize(11).fontColor('#B26A00').margin({ top: 4 })
+      }
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)
@@ -589,6 +663,17 @@ struct Index {
         return;
       }
       this.screenName = this.screenName.trim();
+      this.connState = ConnState.CONNECTING;
+      const peer = tlsPreferenceKey(this.hostInput, Number(this.portInput));
+      const pref = await this.getPrefs();
+      const pin = this.tlsEnabled ? normalizeTlsFingerprint(this.tlsFingerprint || (pref.getSync(peer, '') as string)) : '';
+      if (pin === null) throw new Error('保存的服务端 SHA-256 指纹无效');
+      if (this.tlsEnabled) this.tlsFingerprint = pin;
+      this.activeTlsPeer = peer;
+      if (this.tlsEnabled && pin) {
+        pref.putSync(peer, pin);
+        await pref.flush();
+      }
       // 连接由后台承载 Ability（状态栏项钉定进程）建立，隐藏到托盘时不被冻结。
       const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const want: Want = {
@@ -600,7 +685,9 @@ struct Index {
           'screen': this.screenName,
           'invert': this.invertScroll,
           'autoreconnect': this.autoReconnect,
-          'clipboard': this.clipboardSync
+          'clipboard': this.clipboardSync,
+          'tlsEnabled': this.tlsEnabled,
+          'tlsFingerprint': this.tlsEnabled ? pin : ''
         }
       };
       this.connState = ConnState.CONNECTING;

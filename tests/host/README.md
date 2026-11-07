@@ -43,3 +43,20 @@ and duplicate packets, invalid headers, expiry, and bounded reassembly.
 
 `tests/host/stubs/` holds minimal stand-ins for the HarmonyOS headers
 (`hilog/log.h`, `oh_input_manager.h`) used only by these tests.
+
+## TLS integration
+
+```bash
+python3 tests/host/tls_integration_test.py
+node tests/host/tls_settings_test.mjs
+```
+
+The native integration suite needs Linux/WSL, Python 3.12+, make, g++ and
+openssl. It verifies the bundled Mbed TLS archive hash and builds a local
+driver in `.hvigor/tls-host/`; no downloads or HarmonyOS SDK are needed.
+It connects the production transport to Python's OpenSSL TLS server and
+checks TLS 1.2/1.3 mutual authentication, persistent private client identity,
+unknown/changed certificate rejection before application data, buffered
+TLS reads, concurrent framed writes, handshake deadlines and interruption.
+The Node tests cover fingerprint validation, endpoint-scoped trust and
+parsing certificate notices.

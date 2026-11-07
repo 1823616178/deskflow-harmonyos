@@ -10,7 +10,7 @@
 - **运行时 / 设备**：HarmonyOS 6（API 24，`compileSdkVersion: 6.1.1(24)`），PC/2in1。
 - **UI 层**：ArkTS（ETS），页面 `entry/src/main/ets/pages/Index.ets`。
 - **Native 层**：C++ NAPI，编译为 `libentry.so`，链接 `libohinput.so`（Input Kit C API）。
-- **网络**：POSIX socket（阻塞 + `select` 超时连接），无第三方依赖。
+- **网络**：POSIX socket + `poll` 截止时间；默认启用 Mbed TLS 1.2/1.3，依赖固定版本的上游源码归档。
 - 权限：`ohos.permission.INTERCEPT_INPUT_EVENT`、`ohos.permission.INTERNET`。
 
 ---
@@ -56,7 +56,7 @@
 | **NAPI 桥接** | `cpp/napi_init.cpp` | 导出 JS 接口、管理线程安全函数、事件拦截诊断、注入授权/注入演示；三路 tsfn 共用 `CreateTsfn()` |
 | **协议客户端** | `cpp/protocol/deskflow_client.{h,cpp}` | 连接、握手、消息循环、消息分发、调用注入接口 |
 | **协议编解码** | `cpp/protocol/proto_util.{h,cpp}` `protocol_types.h` | 格式串读写、消息常量、键码/按钮定义 |
-| **传输** | `cpp/protocol/socket_stream.{h,cpp}` | 4 字节 NBO 长度前缀帧封拆、`readExact`/`writeAll`/`select` 连接 |
+| **传输** | `cpp/protocol/socket_stream.{h,cpp}`、`tls_session.{h,cpp}` | 4 字节 NBO 帧封拆、带截止时间的 TCP/TLS 收发、SHA-256 指纹校验和客户端证书 |
 
 ---
 

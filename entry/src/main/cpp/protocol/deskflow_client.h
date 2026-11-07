@@ -52,7 +52,8 @@ public:
     bool clipboardSync() const { return m_clipboardSync.load(); }
 
     // Start connection in a background thread. Returns false if already running.
-    bool start(const std::string& host, uint16_t port, const std::string& screenName);
+    bool start(const std::string& host, uint16_t port, const std::string& screenName,
+               const TlsOptions& tls = {});
 
     // Set local screen size in vp units (reported via DINF, coordinate space for DMMV)
     void setScreenSize(int32_t w, int32_t h)
@@ -139,6 +140,7 @@ private:
     std::string m_host;
     uint16_t m_port;
     std::string m_screenName;
+    TlsOptions m_tlsOptions;
 
     // screen state (vp units)
     int32_t m_screenW = 1280;

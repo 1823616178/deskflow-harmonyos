@@ -321,7 +321,8 @@ void DeskflowClient::resetSessionState(bool releaseInputs)
     m_lastFrameTimeMs = nowMs();
 }
 
-bool DeskflowClient::start(const std::string& host, uint16_t port, const std::string& screenName)
+bool DeskflowClient::start(const std::string& host, uint16_t port, const std::string& screenName,
+                           const TlsOptions& tls)
 {
     if (m_running.load()) {
         return false;
@@ -330,6 +331,7 @@ bool DeskflowClient::start(const std::string& host, uint16_t port, const std::st
     m_host = host;
     m_port = port;
     m_screenName = screenName;
+    m_tlsOptions = tls;
     m_stopRequested = false;
     m_running = true;
     // Joinable (not detached): start() refuses while the previous
@@ -532,7 +534,7 @@ void DeskflowClient::run()
     }
 
     m_running = false;
-    if (!m_stopRequested.load()) {
+    if (!m_stopRequested.load() && !m_stream.tlsRejected()) {
         // 循环因不再重连而退出（如收到 CBYE/EICV）
         setStatus("disconnected");
     }
@@ -544,10 +546,14 @@ bool DeskflowClient::runOnce()
     resetSessionState(true);
     setStatus("connecting to " + m_host + ":" + std::to_string(m_port));
     DF_LOGI("connecting to %{public}s:%{public}d", m_host.c_str(), m_port);
-    if (!m_stream.connect(m_host, m_port, 5000)) {
+    const bool connected = m_stream.connect(m_host, m_port, 5000, m_tlsOptions);
+    if (!m_stream.clientFingerprint().empty()) {
+        setStatus("tls client fingerprint: " + m_stream.clientFingerprint());
+    }
+    if (!connected) {
         DF_LOGE("connect failed");
-        setStatus("error: connect failed");
-        return true;  // 可重连（例如服务端暂不可达）
+        setStatus("error: " + (m_stream.lastError().empty() ? std::string("connect failed") : m_stream.lastError()));
+        return !m_stream.tlsRejected();
     }
     if (m_stopRequested.load()) {
         m_stream.close();

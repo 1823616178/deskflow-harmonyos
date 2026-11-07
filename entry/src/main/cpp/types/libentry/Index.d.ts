@@ -35,7 +35,8 @@ export const onDeskflowStatus: (callback: (event: ValueChangeEvent) => void) => 
 export const onClipboardData: (callback: (event: ValueChangeEvent) => void) => void;
 export const pushClipboard: (text: string) => string;
 export const setClipboardSync: (enable: boolean) => string;
-export const connectDeskflow: (host: string, port: number, name: string, screenW: number, screenH: number) => string;
+export const connectDeskflow: (host: string, port: number, name: string, screenW: number, screenH: number,
+  tlsEnabled: boolean, serverFingerprint: string, identityPath: string) => string;
 export const disconnectDeskflow: () => string;
 export const setInvertScroll: (invert: boolean) => string;
 export const setAutoReconnect: (enable: boolean) => string;

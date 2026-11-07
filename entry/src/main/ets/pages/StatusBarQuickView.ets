@@ -46,6 +46,7 @@ struct StatusBarQuickView {
           }
           try {
             const parsed = JSON.parse(`${data.data}`) as Record<string, string>;
+            if (parsed.code === 'tls_identity') return;
             if (typeof parsed.message === 'string') {
               this.statusText = parsed.message;
             }
