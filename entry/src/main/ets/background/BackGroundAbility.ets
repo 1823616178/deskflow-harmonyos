@@ -12,7 +12,7 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { display } from '@kit.ArkUI';
 import deskflow from 'libentry.so';
-import { ClipboardAssembler, ClipboardChunk } from './ClipboardTransfer';
+import { ClipboardAssembler, ClipboardChunk, splitClipboardText } from './ClipboardTransfer';
 
 const DOMAIN = 0x0000;
 const TAG = 'DeskflowBG';
@@ -113,8 +113,10 @@ export default class BackGroundAbility extends UIAbility {
     try {
       deskflow.onClipboardData((event: deskflow.ValueChangeEvent) => {
         hilog.info(DOMAIN, TAG, 'onClipboardData recv len=%{public}d, publish BGEVT_CLIP', (event.value ?? '').length);
-        const msg: commonEventManager.CommonEventData = { event: BGEVT_CLIP, data: event.value };
-        this.publish(msg);
+        const id = `remote-${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
+        for (const chunk of splitClipboardText(event.value ?? '', id)) {
+          this.publish({ event: BGEVT_CLIP, data: JSON.stringify(chunk) });
+        }
       });
     } catch (e) {
       hilog.error(DOMAIN, TAG, 'clip cb fail: %{public}s', JSON.stringify(e));
@@ -122,7 +124,9 @@ export default class BackGroundAbility extends UIAbility {
     // 订阅「断开」事件：主窗口触发时停止后台承载
     try {
       if (!this.stopSub) {
-        const info: commonEventManager.CommonEventSubscribeInfo = { events: [BGEVT_STOP] };
+        const info: commonEventManager.CommonEventSubscribeInfo = {
+          events: [BGEVT_STOP], publisherBundleName: this.context.abilityInfo.bundleName
+        };
         this.stopSub = commonEventManager.createSubscriberSync(info);
         commonEventManager.subscribe(this.stopSub, (err, data) => {
           if (!err) {
@@ -139,7 +143,9 @@ export default class BackGroundAbility extends UIAbility {
     // 订阅「推送本机剪贴板」：主窗口把本机剪贴板文本发来，由本进程（持有连接）推给服务端（鸿蒙→Windows）
     try {
       if (!this.pushSub) {
-        const pushInfo: commonEventManager.CommonEventSubscribeInfo = { events: [BGEVT_CLIP_PUSH] };
+        const pushInfo: commonEventManager.CommonEventSubscribeInfo = {
+          events: [BGEVT_CLIP_PUSH], publisherBundleName: this.context.abilityInfo.bundleName
+        };
         this.pushSub = commonEventManager.createSubscriberSync(pushInfo);
         commonEventManager.subscribe(this.pushSub, (err, data) => {
           if (!err && data?.data) {
@@ -169,7 +175,9 @@ export default class BackGroundAbility extends UIAbility {
     // 连接后改开关当次完全不生效。
     try {
       if (!this.settingsSub) {
-        const settingsInfo: commonEventManager.CommonEventSubscribeInfo = { events: [BGEVT_SETTINGS] };
+        const settingsInfo: commonEventManager.CommonEventSubscribeInfo = {
+          events: [BGEVT_SETTINGS], publisherBundleName: this.context.abilityInfo.bundleName
+        };
         this.settingsSub = commonEventManager.createSubscriberSync(settingsInfo);
         commonEventManager.subscribe(this.settingsSub, (err, data) => {
           if (err || !data?.data) {
@@ -196,7 +204,9 @@ export default class BackGroundAbility extends UIAbility {
       hilog.error(DOMAIN, TAG, 'settings sub fail: %{public}s', JSON.stringify(e));
     }
     try {
-      const info: commonEventManager.CommonEventSubscribeInfo = { events: [BGEVT_STATUS_REQUEST] };
+      const info: commonEventManager.CommonEventSubscribeInfo = {
+        events: [BGEVT_STATUS_REQUEST], publisherBundleName: this.context.abilityInfo.bundleName
+      };
       this.statusRequestSub = commonEventManager.createSubscriberSync(info);
       commonEventManager.subscribe(this.statusRequestSub, (err) => {
         if (!err) this.publish({ event: BGEVT_STATUS, data: this.lastStatus });
@@ -224,7 +234,9 @@ export default class BackGroundAbility extends UIAbility {
 
   private publish(msg: commonEventManager.CommonEventData): void {
     try {
-      const opts: commonEventManager.CommonEventPublishData = { data: msg.data };
+      const opts: commonEventManager.CommonEventPublishData = {
+        data: msg.data, bundleName: this.context.abilityInfo.bundleName
+      };
       commonEventManager.publish(msg.event, opts, (err) => {
         if (err) {
           hilog.error(DOMAIN, TAG, 'publish %{public}s fail: %{public}s', msg.event, JSON.stringify(err));

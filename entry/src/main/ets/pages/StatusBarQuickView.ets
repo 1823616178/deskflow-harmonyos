@@ -5,6 +5,7 @@
 
 import { commonEventManager } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { common } from '@kit.AbilityKit';
 import { desktopManager } from '../statusbar/DeskflowStatusStore';
 import { ConnState } from '../statusbar/StatusBarManager';
 import { BGEVT_STATUS, BGEVT_STATUS_REQUEST } from '../background/BackGroundAbility';
@@ -33,7 +34,11 @@ struct StatusBarQuickView {
     // 并不共享，之前这里永远显示初始值“未连接”。改走后台广播拿状态。
     try {
       if (!this.bgSub) {
-        const info: commonEventManager.CommonEventSubscribeInfo = { events: [BGEVT_STATUS] };
+        const context = this.getUIContext().getHostContext() as common.Context;
+        const bundleName = context.applicationInfo.name;
+        const info: commonEventManager.CommonEventSubscribeInfo = {
+          events: [BGEVT_STATUS], publisherBundleName: bundleName
+        };
         this.bgSub = commonEventManager.createSubscriberSync(info);
         commonEventManager.subscribe(this.bgSub, (err, data) => {
           if (err || !data?.data) {
@@ -64,7 +69,7 @@ struct StatusBarQuickView {
             hilog.warn(DOMAIN, 'DeskflowStatusBar', 'quick view status parse fail: %{public}s', JSON.stringify(e));
           }
         });
-        commonEventManager.publish(BGEVT_STATUS_REQUEST, { data: 'state' }, (err) => {
+        commonEventManager.publish(BGEVT_STATUS_REQUEST, { data: 'state', bundleName: bundleName }, (err) => {
           if (err) hilog.warn(DOMAIN, 'DeskflowStatusBar', 'status request fail: %{public}s', JSON.stringify(err));
         });
       }

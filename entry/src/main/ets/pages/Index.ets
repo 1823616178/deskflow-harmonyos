@@ -23,7 +23,7 @@ import { ConnState, StatusBarManager } from '../statusbar/StatusBarManager';
 import { desktopManager } from '../statusbar/DeskflowStatusStore';
 import { BGEVT_STATUS, BGEVT_CLIP, BGEVT_STOP, BGEVT_CLIP_PUSH, BGEVT_SETTINGS, BGEVT_READY } from '../background/BackGroundAbility';
 import { DeskflowStatusData } from '../background/DeskflowEventData';
-import { splitClipboardText } from '../background/ClipboardTransfer';
+import { ClipboardAssembler, ClipboardChunk, splitClipboardText } from '../background/ClipboardTransfer';
 
 const DOMAIN = 0x0000;
 const PREFS_NAME = 'deskflow_config';
@@ -66,6 +66,7 @@ struct Index {
   @State clipLast: string = ''; // 最近一次读取的本机剪贴板内容（按钮读取结果提示）
   // 剪贴板桥接：避免把刚写入的本机内容又当成本机新复制推回去（回环）
   private lastRemoteClipboard: string = '';
+  private remoteClipChunks: ClipboardAssembler = new ClipboardAssembler();
   // 后台承载 Ability 事件订阅器；必须持有引用，否则可能被 GC 回收导致收不到 commonEvent
   private bgSub: commonEventManager.CommonEventSubscriber | null = null;
   private startingConnection: boolean = false;
@@ -74,6 +75,11 @@ struct Index {
   private clipListenerRegistered: boolean = false;
   // Preferences 实例缓存：之前每次 load/save 都新建实例。
   private prefsPromise: Promise<preferences.Preferences> | null = null;
+
+  private appBundleName(): string {
+    const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    return context.abilityInfo.bundleName;
+  }
 
   private getPrefs(): Promise<preferences.Preferences> {
     if (!this.prefsPromise) {
@@ -95,7 +101,7 @@ struct Index {
         autoReconnect: this.autoReconnect,
         clipboard: this.clipboardSync
       });
-      const opts: commonEventManager.CommonEventPublishData = { data: payload };
+      const opts: commonEventManager.CommonEventPublishData = { data: payload, bundleName: this.appBundleName() };
       commonEventManager.publish(BGEVT_SETTINGS, opts, (err) => {
         if (err) {
           hilog.warn(DOMAIN, 'DeskflowBg', 'settings publish fail: %{public}s', JSON.stringify(err));
@@ -105,6 +111,8 @@ struct Index {
       });
     } catch (e) {
       hilog.warn(DOMAIN, 'DeskflowBg', 'publishSettings error: %{public}s', JSON.stringify(e));
+      this.statusText = '设置同步失败，请重试';
+      this.syncTray();
     }
   }
 
@@ -191,7 +199,7 @@ struct Index {
         return; // 已订阅
       }
       const info: commonEventManager.CommonEventSubscribeInfo =
-        { events: [BGEVT_STATUS, BGEVT_CLIP, BGEVT_READY] };
+        { events: [BGEVT_STATUS, BGEVT_CLIP, BGEVT_READY], publisherBundleName: this.appBundleName() };
       const sub = commonEventManager.createSubscriberSync(info);
       this.bgSub = sub; // 持有引用，防止 GC 回收导致订阅失效
       hilog.info(DOMAIN, 'DeskflowBg', 'subscribeBgEvents: created subscriber %{public}s', info.events.join(','));
@@ -210,10 +218,16 @@ struct Index {
           }
           this.syncTray();
         } else if (data?.event === BGEVT_CLIP) {
-          const value = `${data.data ?? ''}`;
-          hilog.info(DOMAIN, 'DeskflowClip', 'recv remote clip len=%{public}d', value.length);
-          this.lastRemoteClipboard = value;
-          this.setSystemClipboard(value);
+          try {
+            const chunk = JSON.parse(`${data.data ?? ''}`) as ClipboardChunk;
+            const value = this.remoteClipChunks.accept(chunk);
+            if (value !== null && this.clipboardSync) {
+              this.lastRemoteClipboard = value;
+              this.setSystemClipboard(value);
+            }
+          } catch (e) {
+            hilog.warn(DOMAIN, 'DeskflowClip', 'invalid remote clipboard packet');
+          }
         }
       });
     } catch (e) {
@@ -373,7 +387,9 @@ struct Index {
     const id = `${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
     const chunks = splitClipboardText(text, id);
     for (const chunk of chunks) {
-      const opts: commonEventManager.CommonEventPublishData = { data: JSON.stringify(chunk) };
+      const opts: commonEventManager.CommonEventPublishData = {
+        data: JSON.stringify(chunk), bundleName: this.appBundleName()
+      };
       await new Promise<void>((resolve, reject) => {
         commonEventManager.publish(BGEVT_CLIP_PUSH, opts, (err) => {
           if (err && err.code) reject(err);
@@ -647,7 +663,7 @@ struct Index {
   /** 通知后台承载 Ability 停止（终止旧连接进程） */
   private requestBgStop(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
-      const opts: commonEventManager.CommonEventPublishData = { data: 'stop' };
+      const opts: commonEventManager.CommonEventPublishData = { data: 'stop', bundleName: this.appBundleName() };
       commonEventManager.publish(BGEVT_STOP, opts, (err) => {
         if (err && err.code) {
           reject(err);
