@@ -14,7 +14,7 @@
  */
 {
   "app": {
-    "bundleName": "com.deskflow.ohospoc",
+    "bundleName": "deskflow.rymaker.com",
     "vendor": "deskflow",
     "versionCode": 1000000,
     "versionName": "1.0.0",

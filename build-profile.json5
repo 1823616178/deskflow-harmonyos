@@ -26,7 +26,6 @@
     "products": [
       {
         "name": "default",
-        "compileSdkVersion": "6.1.1(24)",
         "compatibleSdkVersion": "5.0.0(12)",
         "targetSdkVersion": "6.0.0(20)",
         "runtimeOS": "HarmonyOS",
@@ -34,7 +33,8 @@
           "strictMode": {
             "caseSensitiveCheck": true,
             "useNormalizedOHMUrl": true
-          }
+          },
+          "nativeCompiler": "BiSheng"
         }
       }
     ],
